@@ -70,6 +70,19 @@ pub(crate) fn option_query() -> &'static tree_sitter::Query {
     })
 }
 
+// ── definition query ──────────────────────────────────────────────────────────
+
+static COMMODITY_DEFINITION_QUERY: OnceLock<tree_sitter::Query> = OnceLock::new();
+
+/// Currencies declared by commodity directives — used for goto-definition.
+pub(crate) fn commodity_definition_query() -> &'static tree_sitter::Query {
+    COMMODITY_DEFINITION_QUERY.get_or_init(|| {
+        let q = r#"(commodity (currency) @currency)"#;
+        tree_sitter::Query::new(&tree_sitter_beancount::language(), q)
+            .expect("Failed to compile commodity definition query")
+    })
+}
+
 // ── references query ──────────────────────────────────────────────────────────
 
 static ACCOUNT_QUERY: OnceLock<tree_sitter::Query> = OnceLock::new();
@@ -153,6 +166,7 @@ mod tests {
         currency_query();
         note_query();
         option_query();
+        commodity_definition_query();
         account_query();
         include_query();
         format_query();

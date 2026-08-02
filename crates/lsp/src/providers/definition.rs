@@ -1,5 +1,6 @@
 use crate::beancount_data::get_unified_query;
 use crate::document::Document;
+use crate::query_cache;
 use crate::server::LspServerStateSnapshot;
 use crate::treesitter_utils::{
     lsp_position_to_tree_sitter_point_range, text_for_tree_sitter_node,
@@ -40,14 +41,22 @@ pub(crate) fn definition(
         return Ok(None);
     };
 
-    if NodeKind::Account != node.kind().into() {
-        return Ok(None);
-    }
+    let (query, capture_name) = match node.kind().into() {
+        NodeKind::Account => (get_unified_query(), "account"),
+        NodeKind::Currency => (query_cache::commodity_definition_query(), "currency"),
+        _ => return Ok(None),
+    };
 
     let origin_selection_range = tree_sitter_node_to_lsp_range(&content, &node);
 
     let node_text = text_for_tree_sitter_node(&content, &node);
-    let locs = find_account_open_definitions(&snapshot.forest, &snapshot.open_docs, node_text);
+    let locs = find_definitions(
+        &snapshot.forest,
+        &snapshot.open_docs,
+        query,
+        capture_name,
+        node_text,
+    );
     if locs.is_empty() {
         return Ok(None);
     }
@@ -65,19 +74,20 @@ pub(crate) fn definition(
     Ok(Some(DefinitionResponse::DefinitionLinkList(links)))
 }
 
-fn find_account_open_definitions(
+fn find_definitions(
     forest: &HashMap<PathBuf, Arc<tree_sitter::Tree>>,
     open_docs: &HashMap<PathBuf, Document>,
+    query: &tree_sitter::Query,
+    capture_name: &str,
     node_text: String,
 ) -> Vec<Location> {
     forest
         .iter()
         .flat_map(|(url, tree)| {
-            let query = get_unified_query();
-            let capture_account = match query.capture_index_for_name("account") {
+            let capture_index = match query.capture_index_for_name(capture_name) {
                 Some(index) => index,
                 None => {
-                    tracing::warn!("Query missing capture 'account'");
+                    tracing::warn!("Query missing capture '{capture_name}'");
                     return vec![];
                 }
             };
@@ -103,7 +113,7 @@ fn find_account_open_definitions(
             let mut matches = query_cursor.matches(query, tree.root_node(), source);
             let mut results = Vec::new();
             while let Some(m) = matches.next() {
-                if let Some(node) = m.nodes_for_capture_index(capture_account).next() {
+                if let Some(node) = m.nodes_for_capture_index(capture_index).next() {
                     let m_text = match node.utf8_text(source) {
                         Ok(text) => text,
                         Err(err) => {
@@ -143,6 +153,28 @@ mod tests {
             content: Rope::from_str(text),
             version: 1,
         }
+    }
+
+    fn find_account_open_definitions(
+        forest: &HashMap<PathBuf, Arc<tree_sitter::Tree>>,
+        open_docs: &HashMap<PathBuf, Document>,
+        node_text: String,
+    ) -> Vec<Location> {
+        find_definitions(forest, open_docs, get_unified_query(), "account", node_text)
+    }
+
+    fn find_commodity_definitions(
+        forest: &HashMap<PathBuf, Arc<tree_sitter::Tree>>,
+        open_docs: &HashMap<PathBuf, Document>,
+        node_text: String,
+    ) -> Vec<Location> {
+        find_definitions(
+            forest,
+            open_docs,
+            query_cache::commodity_definition_query(),
+            "currency",
+            node_text,
+        )
     }
 
     #[test]
@@ -204,6 +236,49 @@ mod tests {
 
         let locs =
             find_account_open_definitions(&forest, &open_docs, "Liabilities:Card".to_string());
+
+        assert!(locs.is_empty());
+    }
+
+    #[test]
+    fn test_find_commodity_definitions_single_match() {
+        let text = "2024-01-01 commodity USD\n\n2024-01-02 * \"Payee\" \"Narration\"\n  Assets:Cash  100.00 USD\n  Expenses:Misc\n";
+        let path = std::env::temp_dir().join("definition_test_commodity.bean");
+        let tree = Arc::new(make_tree(text));
+
+        let mut forest = HashMap::new();
+        forest.insert(path.clone(), tree);
+
+        let mut open_docs = HashMap::new();
+        open_docs.insert(path.clone(), make_doc(text));
+
+        let locs = find_commodity_definitions(&forest, &open_docs, "USD".to_string());
+
+        // Only the commodity directive matches, not the posting usage
+        assert_eq!(locs.len(), 1);
+        let loc = &locs[0];
+        assert_eq!(loc.range.start.line, 0);
+        assert_eq!(loc.range.start.character, 21);
+        assert_eq!(loc.range.end.line, 0);
+        assert_eq!(loc.range.end.character, 24);
+
+        let expected_uri = lsp_types::Uri::from_file_path(&path).unwrap();
+        assert_eq!(loc.uri, expected_uri);
+    }
+
+    #[test]
+    fn test_find_commodity_definitions_no_match() {
+        let text = "2024-01-01 commodity USD\n";
+        let path = std::env::temp_dir().join("definition_test_commodity_none.bean");
+        let tree = Arc::new(make_tree(text));
+
+        let mut forest = HashMap::new();
+        forest.insert(path.clone(), tree);
+
+        let mut open_docs = HashMap::new();
+        open_docs.insert(path, make_doc(text));
+
+        let locs = find_commodity_definitions(&forest, &open_docs, "EUR".to_string());
 
         assert!(locs.is_empty());
     }
