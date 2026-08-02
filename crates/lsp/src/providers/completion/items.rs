@@ -1467,6 +1467,70 @@ mod tests {
     }
 
     #[test]
+    fn test_complete_tag() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        let test_data = r#"
+2026-01-01 * "Store" "Groceries" #vacation #travel
+2026-01-02 * "Station" "Gas" #travel
+"#;
+
+        let mut data_map = HashMap::new();
+        let bean_data = create_test_beancount_data(test_data);
+        data_map.insert(PathBuf::from("test.bean"), Arc::new(bean_data));
+
+        let items = complete_tag(&data_map, "").unwrap();
+
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels.len(), 2, "Tags should be deduplicated");
+        assert!(labels.contains(&"vacation"));
+        assert!(labels.contains(&"travel"));
+        assert!(
+            items.iter().all(|i| i.detail.as_deref() == Some("Tag")
+                && i.kind == Some(CompletionItemKind::Keyword))
+        );
+
+        let items = complete_tag(&data_map, "va").unwrap();
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"vacation"));
+        assert!(!labels.contains(&"travel"));
+    }
+
+    #[test]
+    fn test_complete_link() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        let test_data = r#"
+2026-01-01 * "Store" "Groceries" ^receipt-123
+2026-01-02 * "Station" "Gas" ^invoice-42 ^receipt-123
+"#;
+
+        let mut data_map = HashMap::new();
+        let bean_data = create_test_beancount_data(test_data);
+        data_map.insert(PathBuf::from("test.bean"), Arc::new(bean_data));
+
+        let items = complete_link(&data_map, "").unwrap();
+
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels.len(), 2, "Links should be deduplicated");
+        assert!(labels.contains(&"receipt-123"));
+        assert!(labels.contains(&"invoice-42"));
+        assert!(
+            items.iter().all(|i| i.detail.as_deref() == Some("Link")
+                && i.kind == Some(CompletionItemKind::Keyword))
+        );
+
+        let items = complete_link(&data_map, "rec").unwrap();
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"receipt-123"));
+        assert!(!labels.contains(&"invoice-42"));
+    }
+
+    #[test]
     fn test_complete_narration_with_prefix() {
         use ropey::Rope;
         use std::collections::HashMap;

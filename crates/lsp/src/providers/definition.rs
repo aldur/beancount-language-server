@@ -137,8 +137,71 @@ fn find_definitions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::beancount_data::BeancountData;
+    use crate::config::Config;
     use ropey::Rope;
     use tree_sitter::Parser;
+
+    struct TestState {
+        snapshot: LspServerStateSnapshot,
+        path: PathBuf,
+    }
+
+    impl TestState {
+        fn new(content: &str) -> anyhow::Result<Self> {
+            let path = std::env::current_dir()?.join("test.beancount");
+            let rope_content = Rope::from_str(content);
+
+            let mut parser = tree_sitter::Parser::new();
+            parser.set_language(&tree_sitter_beancount::language())?;
+            let tree = parser.parse(content, None).unwrap();
+
+            let mut forest = HashMap::new();
+            forest.insert(path.clone(), Arc::new(tree.clone()));
+
+            let mut open_docs = HashMap::new();
+            open_docs.insert(
+                path.clone(),
+                Document {
+                    content: rope_content.clone(),
+                    version: 0,
+                },
+            );
+
+            let mut beancount_data = HashMap::new();
+            beancount_data.insert(
+                path.clone(),
+                Arc::new(BeancountData::new(&tree, &rope_content)),
+            );
+
+            let config = Config::new(path.clone());
+
+            Ok(Self {
+                snapshot: LspServerStateSnapshot {
+                    forest: Arc::new(forest),
+                    forest_content: Arc::new(HashMap::new()),
+                    open_docs: Arc::new(open_docs),
+                    beancount_data: Arc::new(beancount_data),
+                    config,
+                    checker: None,
+                },
+                path,
+            })
+        }
+
+        fn definition_params(&self, line: u32, character: u32) -> lsp_types::DefinitionParams {
+            lsp_types::DefinitionParams {
+                text_document_position_params: lsp_types::TextDocumentPositionParams {
+                    text_document: lsp_types::TextDocumentIdentifier {
+                        uri: lsp_types::Uri::from_file_path(&self.path).unwrap(),
+                    },
+                    position: lsp_types::Position { line, character },
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            }
+        }
+    }
 
     fn make_tree(text: &str) -> tree_sitter::Tree {
         let mut parser = Parser::new();
@@ -281,5 +344,102 @@ mod tests {
         let locs = find_commodity_definitions(&forest, &open_docs, "EUR".to_string());
 
         assert!(locs.is_empty());
+    }
+
+    #[test]
+    fn test_definition_handler_account() {
+        let content = r#"
+2024-01-01 open Assets:Checking
+2024-01-02 * "Test"
+  Assets:Checking  100.00 USD
+  Expenses:Food   -100.00 USD
+"#;
+        let state = TestState::new(content).unwrap();
+        let uri = lsp_types::Uri::from_file_path(&state.path).unwrap();
+
+        // Cursor on "Assets:Checking" in the posting
+        let params = state.definition_params(3, 5);
+        let result = definition(state.snapshot, params).unwrap();
+
+        let Some(DefinitionResponse::DefinitionLinkList(links)) = result else {
+            panic!("Expected DefinitionLinkList");
+        };
+        assert_eq!(links.len(), 1);
+        let link = &links[0];
+        assert_eq!(link.target_uri, uri);
+        // Target is the account in the open directive
+        assert_eq!(link.target_range.start.line, 1);
+        assert_eq!(link.target_range.start.character, 16);
+        assert_eq!(link.target_range.end.character, 31);
+        // Origin covers the account under the cursor
+        let origin = link.origin_selection_range.expect("origin range");
+        assert_eq!(origin.start.line, 3);
+        assert_eq!(origin.start.character, 2);
+        assert_eq!(origin.end.character, 17);
+    }
+
+    #[test]
+    fn test_definition_handler_commodity() {
+        let content = r#"
+2024-01-01 commodity USD
+2024-01-02 * "Test"
+  Assets:Checking  100.00 USD
+  Expenses:Food   -100.00 USD
+"#;
+        let state = TestState::new(content).unwrap();
+        let uri = lsp_types::Uri::from_file_path(&state.path).unwrap();
+
+        // Cursor on "USD" in the posting
+        let params = state.definition_params(3, 27);
+        let result = definition(state.snapshot, params).unwrap();
+
+        let Some(DefinitionResponse::DefinitionLinkList(links)) = result else {
+            panic!("Expected DefinitionLinkList");
+        };
+        assert_eq!(links.len(), 1);
+        let link = &links[0];
+        assert_eq!(link.target_uri, uri);
+        // Target is the currency in the commodity directive
+        assert_eq!(link.target_range.start.line, 1);
+        assert_eq!(link.target_range.start.character, 21);
+        assert_eq!(link.target_range.end.character, 24);
+        // Origin covers the currency under the cursor
+        let origin = link.origin_selection_range.expect("origin range");
+        assert_eq!(origin.start.line, 3);
+        assert_eq!(origin.start.character, 26);
+        assert_eq!(origin.end.character, 29);
+    }
+
+    #[test]
+    fn test_definition_handler_commodity_undeclared() {
+        let content = r#"
+2024-01-01 commodity USD
+2024-01-02 * "Test"
+  Assets:Checking  100.00 EUR
+  Expenses:Food   -100.00 EUR
+"#;
+        let state = TestState::new(content).unwrap();
+
+        // Cursor on "EUR", which has no commodity directive
+        let params = state.definition_params(3, 27);
+        let result = definition(state.snapshot, params).unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_definition_handler_other_node() {
+        let content = r#"
+2024-01-01 commodity USD
+2024-01-02 * "Test"
+  Assets:Checking  100.00 USD
+"#;
+        let state = TestState::new(content).unwrap();
+
+        // Cursor on the narration string: not an account or currency
+        let params = state.definition_params(2, 14);
+        let result = definition(state.snapshot, params).unwrap();
+
+        assert!(result.is_none());
     }
 }
