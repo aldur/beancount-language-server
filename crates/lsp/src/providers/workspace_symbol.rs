@@ -21,12 +21,17 @@ pub(crate) fn workspace_symbols(
 
     // Search across all documents in workspace
     for (path, tree) in snapshot.forest.iter() {
+        // Open buffer first, then the cached rope: a workspace-wide search
+        // must cover the whole forest, not just currently-open buffers.
         let content = match snapshot.open_docs.get(path) {
             Some(doc) => &doc.content,
-            None => {
-                tracing::warn!("Document not found in open_docs: {:?}", path);
-                continue;
-            }
+            None => match snapshot.forest_content.get(path) {
+                Some(stored) => stored.as_ref(),
+                None => {
+                    tracing::debug!("No cached content for forest file: {:?}", path);
+                    continue;
+                }
+            },
         };
 
         let url = match Url::from_file_path(path) {
