@@ -1,4 +1,49 @@
+use std::ops::ControlFlow;
+use std::time::{Duration, Instant};
 use tree_sitter_beancount::tree_sitter;
+
+/// Wall-clock budget for a single parse.
+///
+/// tree-sitter's error recovery is superlinear on some pathological input
+/// (tens of thousands of nested `(`): a single paste of such a file parsed
+/// for minutes, and since documents are parsed on the main loop that froze
+/// the entire server, not just one request.
+pub(crate) const PARSE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Parse `text`, giving up after [`PARSE_BUDGET`].
+///
+/// Returns `None` when the budget is exhausted; callers must treat that like
+/// any other parse failure rather than assuming a tree exists.
+pub(crate) fn parse_with_budget(
+    parser: &mut tree_sitter::Parser,
+    text: &str,
+    old_tree: Option<&tree_sitter::Tree>,
+) -> Option<tree_sitter::Tree> {
+    let deadline = Instant::now() + PARSE_BUDGET;
+    let mut cancelled = false;
+    let tree = {
+        let mut progress = |_: &tree_sitter::ParseState| {
+            if Instant::now() >= deadline {
+                cancelled = true;
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        };
+        let options = tree_sitter::ParseOptions::new().progress_callback(&mut progress);
+        let bytes = text.as_bytes();
+        let mut read = |offset: usize, _: tree_sitter::Point| bytes.get(offset..).unwrap_or(&[]);
+        parser.parse_with_options(&mut read, old_tree, Some(options))
+    };
+    if cancelled {
+        // A cancelled parse leaves the parser mid-parse; the next call must
+        // start clean.
+        parser.reset();
+        tracing::warn!("parse exceeded {PARSE_BUDGET:?} and was cancelled");
+        return None;
+    }
+    tree
+}
 
 /// Maximum tree depth the recursive walkers will descend.
 ///
@@ -8,6 +53,36 @@ use tree_sitter_beancount::tree_sitter;
 /// which aborts the whole process, on any thread, uncatchably.
 pub(crate) const MAX_TREE_DEPTH: usize = 256;
 
+/// True when `tree` is deeper than `limit`.
+///
+/// Depth is the one property that makes an otherwise ordinary document
+/// pathological for everything downstream: tree-sitter's own queries go
+/// superlinear on very deep trees (a document with tens of thousands of
+/// nested `(` froze the main loop inside a query, not in the parse), and the
+/// recursive walkers have to truncate. Rejecting such a tree once, here,
+/// keeps every consumer safe without a budget at each call site.
+pub(crate) fn tree_depth_exceeds(tree: &tree_sitter::Tree, limit: usize) -> bool {
+    let mut cursor = tree.walk();
+    let mut depth = 0usize;
+    loop {
+        while cursor.goto_first_child() {
+            depth += 1;
+            if depth > limit {
+                return true;
+            }
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return false;
+            }
+            depth -= 1;
+        }
+    }
+}
+
 /// Parse a beancount document from scratch.
 /// Returns `None` only if tree-sitter itself fails (extremely rare).
 pub(crate) fn parse_beancount(text: &str) -> Option<tree_sitter::Tree> {
@@ -15,7 +90,7 @@ pub(crate) fn parse_beancount(text: &str) -> Option<tree_sitter::Tree> {
     parser
         .set_language(&tree_sitter_beancount::language())
         .ok()?;
-    parser.parse(text, None)
+    parse_with_budget(&mut parser, text, None)
 }
 
 /// Convert an LSP UTF-16 position into a tree-sitter `Point` (byte-based column).

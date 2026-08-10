@@ -1,6 +1,8 @@
 use crate::beancount_data::BeancountData;
 use crate::document::Document;
-use crate::treesitter_utils::lsp_textdocchange_to_ts_inputedit;
+use crate::treesitter_utils::{
+    MAX_TREE_DEPTH, lsp_textdocchange_to_ts_inputedit, parse_with_budget, tree_depth_exceeds,
+};
 use anyhow::Result;
 use ropey::Rope;
 use std::collections::HashMap;
@@ -79,7 +81,25 @@ impl DocumentStore {
             .get_mut(&uri)
             .expect("parser should exist after insertion");
 
-        let tree = Arc::new(parser.parse(text, None).expect("Failed to parse document"));
+        // A parse can fail (or be cancelled by its budget): keep the buffer,
+        // leave the file out of the forest, and let providers decline rather
+        // than panicking the main loop.
+        let parsed = parse_with_budget(parser, text, None).filter(|tree| {
+            if tree_depth_exceeds(tree, MAX_TREE_DEPTH) {
+                tracing::warn!("Parse tree for {:?} is pathologically deep", uri);
+                false
+            } else {
+                true
+            }
+        });
+        let Some(tree) = parsed else {
+            tracing::warn!("Failed to parse {:?}; not adding it to the forest", uri);
+            Arc::make_mut(&mut self.forest).remove(&uri);
+            Arc::make_mut(&mut self.beancount_data).remove(&uri);
+            Arc::make_mut(&mut self.forest_content).remove(&uri);
+            return;
+        };
+        let tree = Arc::new(tree);
 
         let doc_content = &self
             .open_docs
@@ -202,6 +222,26 @@ impl DocumentStore {
 
         // Step 3 — clone the old tree (applying ts_edits) and snapshot the text.
         // Both borrows are released before step 4 mutates `parsers`.
+        //
+        // No tree means an earlier parse failed or was rejected; re-parse from
+        // scratch so the document can recover once the user fixes it, instead
+        // of staying unsupported until it is closed and reopened.
+        if !self.forest.contains_key(uri) {
+            let text = self
+                .open_docs
+                .get(uri)
+                .map(|doc| doc.text_string())
+                .unwrap_or_default();
+            if let Some(parser) = self.parsers.get_mut(uri)
+                && let Some(tree) =
+                    parse_with_budget(parser, &text, None).filter(|t| !tree_depth_exceeds(t, MAX_TREE_DEPTH))
+            {
+                Arc::make_mut(&mut self.forest).insert(uri.clone(), Arc::new(tree));
+                Arc::make_mut(&mut self.beancount_data).remove(uri);
+                tracing::debug!("Recovered a parse tree for {:?}", uri);
+            }
+            return Ok(());
+        }
         let (edited_old_tree, text_str) = {
             let old_tree_arc = match self.forest.get(uri) {
                 Some(t) => t,
@@ -232,14 +272,26 @@ impl DocumentStore {
                     return Ok(());
                 }
             };
-            parser.parse(&text_str, Some(&edited_old_tree))
+            parse_with_budget(parser, &text_str, Some(&edited_old_tree))
         };
 
         // Step 5 — commit new tree, lazily invalidate beancount_data.
-        if let Some(tree) = new_tree {
+        if let Some(tree) = new_tree.filter(|t| {
+            if tree_depth_exceeds(t, MAX_TREE_DEPTH) {
+                tracing::warn!("Edited tree for {:?} is pathologically deep, dropping it", uri);
+                false
+            } else {
+                true
+            }
+        }) {
             *Arc::make_mut(&mut self.forest)
                 .get_mut(uri)
                 .expect("tree should exist in forest") = Arc::new(tree);
+            Arc::make_mut(&mut self.beancount_data).remove(uri);
+        } else {
+            // Keep rope and tree from disagreeing: without a usable tree the
+            // file leaves the forest until a later edit parses cleanly.
+            Arc::make_mut(&mut self.forest).remove(uri);
             Arc::make_mut(&mut self.beancount_data).remove(uri);
         }
 
