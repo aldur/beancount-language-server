@@ -51,14 +51,18 @@ pub(super) fn generate_currency_column_edits(
             2 // minimum spacing
         };
 
-        // Create the formatted line: indent + account + spaces + "  " + number + " " + rest
+        // Create the formatted line: indent + account + spaces + "  " + number + rest
+        let rest = line.rest.trim_start();
         let target_line = format!(
-            "{}{}{}  {} {}",
+            "{}{}{}  {}{}{}",
             indent_str,
             account_name,
             " ".repeat(spaces_needed),
             line.number,
-            line.rest.trim_start()
+            // A currency list continues the number's token; anything else is
+            // a separate field.
+            if rest.starts_with(',') { "" } else { " " },
+            rest
         );
 
         if let Some(edit) = create_line_replacement_edit(line.line_num, &target_line, index) {
@@ -87,6 +91,12 @@ pub(super) fn generate_template_edits(
             // Quoted string (e.g. booking method like "FIFO" on an open directive) —
             // preserve verbatim with a single space; do not strip the leading quote.
             format!(" {rest_content}")
+        } else if rest_content.starts_with(',') {
+            // A currency list continues the token before it, so it must not be
+            // separated from it: `open A EUR,USD` has "EUR" as the aligned
+            // field and ",USD" as the rest, and inserting a space there
+            // produced `EUR ,USD` on every format.
+            rest_content.to_string()
         } else if rest_content.starts_with(char::is_alphabetic) {
             // Starts with the currency — apply configured number-currency spacing.
             format!(

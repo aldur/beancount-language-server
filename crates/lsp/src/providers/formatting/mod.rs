@@ -484,6 +484,31 @@ mod tests {
     }
 
     #[test]
+    fn test_formatting_keeps_currency_lists_intact() {
+        // `open A EUR,USD` aligns "EUR" as its field, leaving ",USD" as the
+        // rest of the line — which must not be separated from it.
+        let content = r#"2020-01-01 open Assets:Multi EUR,USD,GBP
+2020-01-01 open Assets:One EUR
+2020-01-01 * "t"
+  Assets:Multi   1.00 EUR
+  Assets:One
+"#;
+
+        let state = TestState::new(content).unwrap();
+        let edits = state.format().unwrap().unwrap();
+        let formatted = apply_edits(content, &edits);
+
+        assert!(
+            formatted.contains("EUR,USD,GBP"),
+            "currency list must stay intact, got: {formatted}"
+        );
+        assert!(
+            !formatted.contains("EUR ,"),
+            "no space before the comma, got: {formatted}"
+        );
+    }
+
+    #[test]
     fn test_formatting_empty_file() {
         let content = "";
 
