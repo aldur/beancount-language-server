@@ -174,7 +174,13 @@ fn find_references(
             let mut results = Vec::new();
             while let Some(m) = matches.next() {
                 if let Some(node) = m.nodes_for_capture_index(capture_account).next() {
-                    let m_text = node.utf8_text(source).expect("");
+                    let m_text = match node.utf8_text(source) {
+                        Ok(text) => text,
+                        Err(err) => {
+                            tracing::debug!("Failed to read node text: {err}");
+                            continue;
+                        }
+                    };
                     if m_text == node_text {
                         results.push((url.clone(), rope.clone(), node));
                     }
