@@ -35,7 +35,15 @@ pub(super) fn extract_formateable_lines(
     let query = query_cache::format_query();
 
     let mut query_cursor = tree_sitter::QueryCursor::new();
-    let mut matches = query_cursor.matches(query, tree.root_node(), index.text().as_bytes());
+    // Bounded: query execution is superlinear on pathological trees, and an
+    // unbounded pass here hangs the formatting request forever.
+    let mut progress = crate::query_utils::query_deadline();
+    let mut matches = query_cursor.matches_with_options(
+        query,
+        tree.root_node(),
+        index.text().as_bytes(),
+        tree_sitter::QueryCursorOptions::new().progress_callback(&mut progress),
+    );
 
     let mut formateable_lines = Vec::new();
 

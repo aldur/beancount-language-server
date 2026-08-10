@@ -580,7 +580,22 @@ impl LspServerState {
         let sender = self.task_sender.clone();
         let path = uri.clone();
         self.thread_pool.execute(move || {
-            let tree = crate::treesitter_utils::parse_beancount(&text).map(Arc::new);
+            // The depth check belongs here, next to the parse: a tree deeper
+            // than the walkers will follow is worse than no tree, because
+            // every query over it is unbounded work.
+            let tree = crate::treesitter_utils::parse_beancount(&text)
+                .filter(|tree| {
+                    if crate::treesitter_utils::tree_depth_exceeds(
+                        tree,
+                        crate::treesitter_utils::MAX_TREE_DEPTH,
+                    ) {
+                        tracing::warn!("Parse tree for {path:?} is pathologically deep");
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .map(Arc::new);
             if let Err(e) = sender.send(Task::Parsed {
                 path,
                 version,

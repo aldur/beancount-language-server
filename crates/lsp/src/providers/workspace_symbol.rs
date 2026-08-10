@@ -243,7 +243,13 @@ fn extract_tags_and_links_query(
 
     let content_bytes = content.text().as_bytes();
     let mut cursor_qry = tree_sitter::QueryCursor::new();
-    let mut matches = cursor_qry.matches(&query, tree.root_node(), content_bytes);
+    let mut progress = crate::query_utils::query_deadline();
+    let mut matches = cursor_qry.matches_with_options(
+        &query,
+        tree.root_node(),
+        content_bytes,
+        tree_sitter::QueryCursorOptions::new().progress_callback(&mut progress),
+    );
 
     let tag_idx = query
         .capture_index_for_name("tag")
