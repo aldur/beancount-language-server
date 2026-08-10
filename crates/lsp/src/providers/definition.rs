@@ -53,6 +53,7 @@ pub(crate) fn definition(
     let locs = find_definitions(
         &snapshot.forest,
         &snapshot.open_docs,
+        &snapshot.forest_content,
         query,
         capture_name,
         node_text,
@@ -77,6 +78,7 @@ pub(crate) fn definition(
 fn find_definitions(
     forest: &HashMap<PathBuf, Arc<tree_sitter::Tree>>,
     open_docs: &HashMap<PathBuf, Document>,
+    forest_content: &HashMap<PathBuf, Arc<Rope>>,
     query: &tree_sitter::Query,
     capture_name: &str,
     node_text: String,
@@ -92,15 +94,17 @@ fn find_definitions(
                 }
             };
 
+            // The text must match the forest tree, so it comes from the
+            // snapshot (open buffer or cached rope) — never from disk, which
+            // may have changed since the tree was parsed and whose bytes the
+            // tree's ranges would then overrun.
             let (text, rope) = if let Some(doc) = open_docs.get(url) {
                 (doc.text().to_string(), doc.content.clone())
+            } else if let Some(stored) = forest_content.get(url) {
+                (stored.to_string(), (**stored).clone())
             } else {
-                let Ok(content) = std::fs::read_to_string(url) else {
-                    tracing::debug!("Failed to read file: {:?}", url);
-                    return vec![];
-                };
-                let rope = Rope::from_str(&content);
-                (content, rope)
+                tracing::debug!("No cached content for forest file: {:?}", url);
+                return vec![];
             };
 
             let Ok(uri) = lsp_types::Uri::from_file_path(url) else {
@@ -223,7 +227,14 @@ mod tests {
         open_docs: &HashMap<PathBuf, Document>,
         node_text: String,
     ) -> Vec<Location> {
-        find_definitions(forest, open_docs, get_unified_query(), "account", node_text)
+        find_definitions(
+            forest,
+            open_docs,
+            &HashMap::new(),
+            get_unified_query(),
+            "account",
+            node_text,
+        )
     }
 
     fn find_commodity_definitions(
@@ -234,6 +245,7 @@ mod tests {
         find_definitions(
             forest,
             open_docs,
+            &HashMap::new(),
             query_cache::commodity_definition_query(),
             "currency",
             node_text,
