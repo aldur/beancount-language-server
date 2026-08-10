@@ -268,7 +268,10 @@ fn create_python_checker(
     root_dir: &Path,
 ) -> Option<SystemPythonChecker> {
     let python_cmd = resolve_python_cmd(config, root_dir)?;
-    let checker = SystemPythonChecker::new(python_cmd);
+    let checker = SystemPythonChecker::new(
+        python_cmd,
+        std::time::Duration::from_secs(config.timeout_secs.max(1)),
+    );
     if checker.is_available() {
         Some(checker)
     } else {

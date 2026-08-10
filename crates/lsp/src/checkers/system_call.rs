@@ -34,7 +34,7 @@ pub struct SystemCallChecker {
 
 /// How long `bean_check_cmd --help` may take before the command is
 /// considered unavailable.
-const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Run a command to completion, killing it at `timeout`.
 ///
@@ -43,10 +43,26 @@ const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(10);
 /// forever, and a handful of saves then starve every request the server
 /// gets. stdout/stderr are drained on their own threads so a chatty child
 /// cannot deadlock against a full pipe while we poll.
-fn run_with_timeout(
-    mut cmd: Command,
+/// Like [`run_with_timeout`], but also returns the child's stdout.
+pub(crate) fn run_with_timeout_capturing_stdout(
+    cmd: Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    run_inner(cmd, timeout)
+}
+
+pub(crate) fn run_with_timeout(
+    cmd: Command,
     timeout: Duration,
 ) -> Result<(std::process::ExitStatus, Vec<u8>)> {
+    let (status, _stdout, stderr) = run_inner(cmd, timeout)?;
+    Ok((status, stderr))
+}
+
+fn run_inner(
+    mut cmd: Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -66,6 +82,7 @@ fn run_with_timeout(
     let stdout_reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout.read_to_end(&mut buf);
+        buf
     });
     let stderr_reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
@@ -91,9 +108,9 @@ fn run_with_timeout(
         }
         std::thread::sleep(Duration::from_millis(30));
     };
-    let _ = stdout_reader.join();
+    let stdout_buf = stdout_reader.join().unwrap_or_default();
     let stderr_buf = stderr_reader.join().unwrap_or_default();
-    Ok((status, stderr_buf))
+    Ok((status, stdout_buf, stderr_buf))
 }
 
 impl SystemCallChecker {

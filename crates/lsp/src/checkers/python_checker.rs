@@ -9,13 +9,18 @@ use tracing::debug;
 #[derive(Debug, Clone)]
 pub struct SystemPythonChecker {
     python_cmd: PathBuf,
+    /// Kill a check that runs longer than this.
+    timeout: std::time::Duration,
 }
 
 const EMBEDDED_BEAN_CHECK: &str = include_str!("./bean_check.py");
 
 impl SystemPythonChecker {
-    pub fn new(python_cmd: PathBuf) -> Self {
-        Self { python_cmd }
+    pub fn new(python_cmd: PathBuf, timeout: std::time::Duration) -> Self {
+        Self {
+            python_cmd,
+            timeout,
+        }
     }
 
     fn python_code_for_script(&self) -> String {
@@ -124,17 +129,32 @@ impl BeancountChecker for SystemPythonChecker {
             self.python_cmd.display()
         );
 
-        let output = Command::new(&self.python_cmd)
-            .arg("-c")
+        // Same deadline discipline as the system checker: this runs on the
+        // shared thread pool, and `load_file` executes the journal's own
+        // plugins, so it can block indefinitely.
+        let mut cmd = Command::new(&self.python_cmd);
+        cmd.arg("-c")
             .arg(self.python_code_for_script())
-            .arg(journal_file)
-            .output()
-            .context(format!(
-                "Failed to execute python checker: {}",
-                self.python_cmd.display()
-            ))?;
+            .arg(journal_file);
+        let (status, stdout, _stderr) =
+            super::system_call::run_with_timeout_capturing_stdout(cmd, self.timeout).context(
+                format!(
+                    "Failed to execute python checker: {}",
+                    self.python_cmd.display()
+                ),
+            )?;
 
-        let (errors, flagged_entries) = self.parse_stdout(&output.stdout, journal_file);
+        let (errors, flagged_entries) = self.parse_stdout(&stdout, journal_file);
+
+        // A crashed interpreter prints a traceback and produces no parseable
+        // output. Reporting that as "no errors" clears every real diagnostic
+        // in the editor, so surface it as a failure instead.
+        if !status.success() && errors.is_empty() && flagged_entries.is_empty() {
+            anyhow::bail!(
+                "python checker exited with {} and produced no parseable output",
+                status
+            );
+        }
 
         Ok(BeancountCheckResult {
             errors,
@@ -176,14 +196,14 @@ mod tests {
     #[test]
     fn test_system_python_checker_new() {
         let python_cmd = PathBuf::from("python3");
-        let checker = SystemPythonChecker::new(python_cmd.clone());
+        let checker = SystemPythonChecker::new(python_cmd.clone(), std::time::Duration::from_secs(30));
         assert_eq!(checker.python_cmd, python_cmd);
         assert_eq!(checker.name(), "SystemPythonChecker");
     }
 
     #[test]
     fn test_python_code_for_script() {
-        let checker = SystemPythonChecker::new(PathBuf::from("python3"));
+        let checker = SystemPythonChecker::new(PathBuf::from("python3"), std::time::Duration::from_secs(30));
         let script = checker.python_code_for_script();
 
         // Verify the embedded script is included
@@ -193,7 +213,7 @@ mod tests {
 
     #[test]
     fn test_parse_stdout_valid_json() {
-        let checker = SystemPythonChecker::new(PathBuf::from("python3"));
+        let checker = SystemPythonChecker::new(PathBuf::from("python3"), std::time::Duration::from_secs(30));
         let (_temp_dir, file_path) = create_temp_beancount_file("");
 
         // Simulate Python checker output: two JSON arrays on separate lines
@@ -213,7 +233,7 @@ mod tests {
 
     #[test]
     fn test_parse_stdout_empty_arrays() {
-        let checker = SystemPythonChecker::new(PathBuf::from("python3"));
+        let checker = SystemPythonChecker::new(PathBuf::from("python3"), std::time::Duration::from_secs(30));
         let (_temp_dir, file_path) = create_temp_beancount_file("");
 
         let stdout = b"[]\n[]";
@@ -225,7 +245,7 @@ mod tests {
 
     #[test]
     fn test_parse_stdout_missing_optional_fields() {
-        let checker = SystemPythonChecker::new(PathBuf::from("python3"));
+        let checker = SystemPythonChecker::new(PathBuf::from("python3"), std::time::Duration::from_secs(30));
         let (_temp_dir, file_path) = create_temp_beancount_file("");
 
         // Error with missing file field
@@ -240,7 +260,7 @@ mod tests {
 
     #[test]
     fn test_parse_stdout_line_zero_uses_root_file() {
-        let checker = SystemPythonChecker::new(PathBuf::from("python3"));
+        let checker = SystemPythonChecker::new(PathBuf::from("python3"), std::time::Duration::from_secs(30));
         let (_temp_dir, file_path) = create_temp_beancount_file("");
 
         let stdout = br#"[{"line": 0, "message": "Root-level error"}]
@@ -254,7 +274,7 @@ mod tests {
 
     #[test]
     fn test_parse_stdout_invalid_utf8() {
-        let checker = SystemPythonChecker::new(PathBuf::from("python3"));
+        let checker = SystemPythonChecker::new(PathBuf::from("python3"), std::time::Duration::from_secs(30));
         let (_temp_dir, file_path) = create_temp_beancount_file("");
 
         // Invalid UTF-8 bytes
@@ -268,7 +288,7 @@ mod tests {
 
     #[test]
     fn test_parse_stdout_invalid_json() {
-        let checker = SystemPythonChecker::new(PathBuf::from("python3"));
+        let checker = SystemPythonChecker::new(PathBuf::from("python3"), std::time::Duration::from_secs(30));
         let (_temp_dir, file_path) = create_temp_beancount_file("");
 
         // Invalid JSON should default to empty arrays
@@ -281,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_parse_stdout_flagged_entry_default_message() {
-        let checker = SystemPythonChecker::new(PathBuf::from("python3"));
+        let checker = SystemPythonChecker::new(PathBuf::from("python3"), std::time::Duration::from_secs(30));
         let (_temp_dir, file_path) = create_temp_beancount_file("");
 
         // Flagged entry without message field should use default
@@ -294,7 +314,7 @@ mod tests {
 
     #[test]
     fn test_parse_stdout_multiple_errors() {
-        let checker = SystemPythonChecker::new(PathBuf::from("python3"));
+        let checker = SystemPythonChecker::new(PathBuf::from("python3"), std::time::Duration::from_secs(30));
         let (_temp_dir, file_path) = create_temp_beancount_file("");
 
         // JSON arrays must be on single lines (first line is errors, second is flagged)
@@ -356,7 +376,7 @@ mod tests {
             PathBuf::from("python3")
         };
 
-        let checker = SystemPythonChecker::new(python_cmd);
+        let checker = SystemPythonChecker::new(python_cmd, std::time::Duration::from_secs(30));
 
         // Skip if Python/beancount not available
         if !checker.is_available() {
@@ -384,7 +404,7 @@ mod tests {
             PathBuf::from("python3")
         };
 
-        let checker = SystemPythonChecker::new(python_cmd);
+        let checker = SystemPythonChecker::new(python_cmd, std::time::Duration::from_secs(30));
 
         if !checker.is_available() {
             return;
@@ -438,7 +458,7 @@ mod tests {
             PathBuf::from("python3")
         };
 
-        let checker = SystemPythonChecker::new(python_cmd);
+        let checker = SystemPythonChecker::new(python_cmd, std::time::Duration::from_secs(30));
 
         if !checker.is_available() {
             return;
@@ -483,7 +503,7 @@ mod tests {
             PathBuf::from("python3")
         };
 
-        let checker = SystemPythonChecker::new(python_cmd);
+        let checker = SystemPythonChecker::new(python_cmd, std::time::Duration::from_secs(30));
 
         if !checker.is_available() {
             return;
