@@ -29,6 +29,13 @@ fn node_text_at_position(
         return Ok(None);
     };
 
+    // The search below only ever matches accounts. Anything else under the
+    // cursor (currency, tag, a whole transaction when on whitespace) would
+    // match nothing — and rename would then report a successful empty edit.
+    if node.kind() != "account" {
+        return Ok(None);
+    }
+
     Ok(Some(text_for_tree_sitter_node(content, &node)))
 }
 
@@ -131,6 +138,10 @@ pub(crate) fn rename(
         edits.sort_by_key(|edit| edit.range.start);
         edits.reverse();
         changes.insert(uri, edits);
+    }
+    // No matches means nothing to rename — not a successful empty edit.
+    if changes.is_empty() {
+        return Ok(None);
     }
     Ok(Some(lsp_types::WorkspaceEdit::new(
         Some(changes),
