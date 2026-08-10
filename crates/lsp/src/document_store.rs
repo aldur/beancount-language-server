@@ -176,7 +176,8 @@ impl DocumentStore {
                     doc.content.utf16_cu_to_char(end_utf16_idx) - end_row_char_idx;
 
                 let start_char_idx = start_row_char_idx + start_col_char_idx;
-                let end_char_idx = end_row_char_idx + end_col_char_idx;
+                // A protocol-invalid inverted range must not panic `remove`.
+                let end_char_idx = (end_row_char_idx + end_col_char_idx).max(start_char_idx);
 
                 tracing::trace!(
                     "Applying change: range={}:{}-{}:{}, char_idx={}-{}, text_len={}",
@@ -525,6 +526,18 @@ mod tests {
             fresh.root_node().to_sexp(),
             "incremental parse diverged from fresh parse of: {text:?}"
         );
+    }
+
+    #[test]
+    fn test_apply_change_inverted_range_does_not_panic() {
+        // Protocol-invalid, but a desynced client can send it; it must not
+        // panic the main loop.
+        let mut store = DocumentStore::new();
+        let uri = PathBuf::from("/test/file.beancount");
+        store.open(uri.clone(), "2024-01-01 open Assets:Cash\n", 1);
+
+        let changes = vec![partial((0, 9), (0, 2), "X")];
+        store.apply_change(&uri, &changes, 2).unwrap();
     }
 
     #[test]
