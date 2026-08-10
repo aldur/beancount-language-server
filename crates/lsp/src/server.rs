@@ -325,8 +325,20 @@ impl LspServerState {
             }
             ProgressMsg::ForestInit { total, done, data } => {
                 if let Some((path, tree, beancount_data, rope)) = *data {
-                    self.doc_store
-                        .insert_tree_and_data(path, tree, beancount_data, rope);
+                    // The forest task parsed this file from disk, possibly long
+                    // ago. If the user opened (and maybe edited) it meanwhile,
+                    // the open buffer is the truth: overwriting its forest tree
+                    // with the disk parse pairs a stale tree with the live rope,
+                    // and every byte range in it is a latent panic.
+                    if self.doc_store.has_open_doc(&path) {
+                        tracing::debug!(
+                            "Forest init: {:?} is open in the editor, keeping the buffer parse",
+                            path
+                        );
+                    } else {
+                        self.doc_store
+                            .insert_tree_and_data(path, tree, beancount_data, rope);
+                    }
                 }
                 let progress_state = if done == 0 {
                     Progress::Begin
