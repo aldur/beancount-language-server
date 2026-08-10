@@ -109,11 +109,13 @@ pub(crate) fn extract_include_paths(
 
     let mut discovered = HashSet::new();
     for pattern in patterns {
+        let mut matched = false;
         match glob(&pattern) {
             Ok(paths) => {
                 for entry in paths {
                     match entry {
                         Ok(path) => {
+                            matched = true;
                             discovered.insert(path);
                         }
                         Err(e) => error!("Glob entry error: {:?}", e),
@@ -121,6 +123,15 @@ pub(crate) fn extract_include_paths(
                 }
             }
             Err(e) => error!("Glob pattern error for '{}': {:?}", pattern, e),
+        }
+        // A literal path whose name contains glob metacharacters ("[", "?")
+        // is a failing-or-empty pattern to glob(); the include must still
+        // resolve if the file exists as written.
+        if !matched {
+            let literal = path::PathBuf::from(&pattern);
+            if literal.exists() {
+                discovered.insert(literal);
+            }
         }
     }
 
