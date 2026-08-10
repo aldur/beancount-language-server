@@ -441,6 +441,44 @@ mod tests {
     }
 
     #[test]
+    fn test_formatting_preserves_comment_after_open_currency() {
+        // The rest of an open directive starts with the comment, not a
+        // currency; slicing from the first alphabetic character ate the "; ".
+        let content = r#"2020-01-01 open Assets:Bank:Checking EUR ; note here
+2023-01-01 * "Test"
+  Assets:Bank:Checking     100.00 USD
+  Expenses:Food 50.0 USD
+"#;
+
+        let state = TestState::new(content).unwrap();
+        let edits = state.format().unwrap().unwrap();
+        let formatted = apply_edits(content, &edits);
+
+        assert!(
+            formatted.contains("; note here"),
+            "Trailing comment must keep its semicolon, got: {formatted}"
+        );
+    }
+
+    #[test]
+    fn test_formatting_preserves_cost_braces() {
+        // A cost's "{1.00 USD}" must not be truncated to "USD}".
+        let content = r#"2023-01-01 * "Test"
+  Assets:Shares  2 STOCK {1.00 USD}
+  Assets:Cash -2.00 USD
+"#;
+
+        let state = TestState::new(content).unwrap();
+        let edits = state.format().unwrap().unwrap();
+        let formatted = apply_edits(content, &edits);
+
+        assert!(
+            formatted.contains("{1.00 USD}"),
+            "Cost braces must survive formatting, got: {formatted}"
+        );
+    }
+
+    #[test]
     fn test_formatting_empty_file() {
         let content = "";
 
