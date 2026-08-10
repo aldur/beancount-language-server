@@ -154,6 +154,9 @@ impl Config {
             if let Some(python_cmd) = bean_check.python_cmd {
                 self.bean_check.python_cmd = Some(PathBuf::from(python_cmd));
             }
+            if let Some(timeout_secs) = bean_check.timeout_secs {
+                self.bean_check.timeout_secs = timeout_secs.max(1);
+            }
         }
 
         // Update completion configuration
@@ -219,6 +222,8 @@ pub struct BeancountCheckOptions {
     pub bean_check_cmd: Option<String>,
     /// Path to Python executable (for python method)
     pub python_cmd: Option<String>,
+    /// Kill a bean-check run that exceeds this many seconds (default 120)
+    pub timeout_secs: Option<u64>,
 }
 
 #[cfg(test)]

@@ -27,6 +27,7 @@ threadpool = "1.8"
 
 # Text processing and parsing
 ropey.workspace = true
+libc.workspace = true
 tree-sitter-beancount = "2.5.1"
 # tree-sitter-beancount = { git = "https://github.com/polarmutex/tree-sitter-beancount.git", branch = "devel" }
 regex.workspace = true

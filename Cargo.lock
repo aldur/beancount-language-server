@@ -142,6 +142,7 @@ dependencies = [
  "glob",
  "insta",
  "itertools 0.15.0",
+ "libc",
  "linked-list",
  "lsp-server",
  "nucleo",

@@ -1,9 +1,11 @@
 use super::BeancountChecker;
 use super::types::*;
 use anyhow::{Context, Result};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 /// Static regex for parsing bean-check error output.
@@ -26,12 +28,81 @@ fn get_error_line_regex() -> &'static regex::Regex {
 pub struct SystemCallChecker {
     /// Path to the bean-check executable
     bean_check_cmd: PathBuf,
+    /// Kill a check that runs longer than this.
+    timeout: Duration,
+}
+
+/// How long `bean_check_cmd --help` may take before the command is
+/// considered unavailable.
+const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run a command to completion, killing it at `timeout`.
+///
+/// Requests run on a bounded thread pool: a bean-check that never exits
+/// (waiting on a lock, reading a tty) would otherwise pin one pool thread
+/// forever, and a handful of saves then starve every request the server
+/// gets. stdout/stderr are drained on their own threads so a chatty child
+/// cannot deadlock against a full pipe while we poll.
+fn run_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, Vec<u8>)> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Its own process group, so the timeout can kill the whole tree:
+    // bean-check is routinely a wrapper script, and killing only the shell
+    // orphans the real process — which also keeps the pipes open, blocking
+    // the reader threads forever.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().context("Failed to spawn command")?;
+
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("Failed to poll command")? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            #[cfg(unix)]
+            unsafe {
+                libc::killpg(child.id() as i32, libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            // Deliberately not joining the readers: should anything in the
+            // tree have survived, they would block on the open pipe.
+            anyhow::bail!("command timed out after {timeout:?} and was killed");
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    };
+    let _ = stdout_reader.join();
+    let stderr_buf = stderr_reader.join().unwrap_or_default();
+    Ok((status, stderr_buf))
 }
 
 impl SystemCallChecker {
     /// Create a new system call checker with the specified bean-check command path.
-    pub fn new(bean_check_cmd: PathBuf) -> Self {
-        Self { bean_check_cmd }
+    pub fn new(bean_check_cmd: PathBuf, timeout: Duration) -> Self {
+        Self {
+            bean_check_cmd,
+            timeout,
+        }
     }
 
     /// Parse bean-check stderr output into structured errors.
@@ -134,23 +205,19 @@ impl BeancountChecker for SystemCallChecker {
             self.bean_check_cmd.display()
         );
 
-        let output = Command::new(&self.bean_check_cmd)
-            .arg(journal_file)
-            .output()
-            .context(format!(
-                "Failed to execute bean-check command: {}",
-                self.bean_check_cmd.display()
-            ))?;
+        let mut cmd = Command::new(&self.bean_check_cmd);
+        cmd.arg(journal_file);
+        let (status, stderr) = run_with_timeout(cmd, self.timeout).context(format!(
+            "Failed to execute bean-check command: {}",
+            self.bean_check_cmd.display()
+        ))?;
 
-        debug!(
-            "SystemCallChecker: command executed, status: {}",
-            output.status
-        );
-        debug!("SystemCallChecker: stderr length: {}", output.stderr.len());
+        debug!("SystemCallChecker: command executed, status: {}", status);
+        debug!("SystemCallChecker: stderr length: {}", stderr.len());
 
-        let errors = if !output.status.success() {
+        let errors = if !status.success() {
             debug!("SystemCallChecker: parsing error output");
-            self.parse_stderr_output(&output.stderr, journal_file)
+            self.parse_stderr_output(&stderr, journal_file)
         } else {
             debug!("SystemCallChecker: no errors found");
             Vec::new()
@@ -170,10 +237,10 @@ impl BeancountChecker for SystemCallChecker {
 
     fn is_available(&self) -> bool {
         // Try to run bean-check with --help to see if it's available
-        Command::new(&self.bean_check_cmd)
-            .arg("--help")
-            .output()
-            .map(|output| output.status.success())
+        let mut cmd = Command::new(&self.bean_check_cmd);
+        cmd.arg("--help");
+        run_with_timeout(cmd, AVAILABILITY_TIMEOUT)
+            .map(|(status, _)| status.success())
             .unwrap_or(false)
     }
 }
@@ -219,15 +286,38 @@ mod tests {
     #[test]
     fn test_system_call_checker_new() {
         let cmd = PathBuf::from("bean-check");
-        let checker = SystemCallChecker::new(cmd.clone());
+        let checker = SystemCallChecker::new(cmd.clone(), std::time::Duration::from_secs(30));
         assert_eq!(checker.bean_check_cmd, cmd);
         assert_eq!(checker.name(), "SystemCall");
     }
 
     #[test]
+    fn test_run_with_timeout_kills_hung_command() {
+        // A bean-check that never exits must not pin a pool thread forever.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("sleep 60");
+        let started = Instant::now();
+        let result = run_with_timeout(cmd, Duration::from_millis(300));
+        assert!(result.is_err(), "hung command must time out");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timeout must fire promptly"
+        );
+    }
+
+    #[test]
+    fn test_run_with_timeout_passes_output_through() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("echo err >&2; exit 1");
+        let (status, stderr) = run_with_timeout(cmd, Duration::from_secs(10)).unwrap();
+        assert!(!status.success());
+        assert_eq!(String::from_utf8_lossy(&stderr).trim(), "err");
+    }
+
+    #[test]
     fn test_system_call_checker_success() {
         let (_temp_dir, file_path) = create_temp_beancount_file("2023-01-01 open Assets:Cash");
-        let checker = SystemCallChecker::new(create_mock_bean_check_success());
+        let checker = SystemCallChecker::new(create_mock_bean_check_success(), Duration::from_secs(30));
 
         let result = checker.check(&file_path);
         // Some systems might not have /bin/true, so just check it doesn't panic
@@ -247,7 +337,7 @@ mod tests {
     #[test]
     fn test_system_call_checker_failure() {
         let (_temp_dir, file_path) = create_temp_beancount_file("invalid content");
-        let checker = SystemCallChecker::new(create_mock_bean_check_failure());
+        let checker = SystemCallChecker::new(create_mock_bean_check_failure(), Duration::from_secs(30));
 
         let result = checker.check(&file_path);
         // Some systems might not have /bin/false, so handle both cases
@@ -267,7 +357,7 @@ mod tests {
     #[test]
     fn test_system_call_checker_invalid_command() {
         let (_temp_dir, file_path) = create_temp_beancount_file("test content");
-        let checker = SystemCallChecker::new(PathBuf::from("/nonexistent/command"));
+        let checker = SystemCallChecker::new(PathBuf::from("/nonexistent/command"), std::time::Duration::from_secs(30));
 
         let result = checker.check(&file_path);
         assert!(result.is_err()); // Should fail to execute
@@ -275,7 +365,7 @@ mod tests {
 
     #[test]
     fn test_parse_stderr_output() {
-        let checker = SystemCallChecker::new(PathBuf::from("bean-check"));
+        let checker = SystemCallChecker::new(PathBuf::from("bean-check"), std::time::Duration::from_secs(30));
         let stderr = b"/path/to/file.beancount:123: Test error message\nanother/file.beancount:456: Another error";
         let root_file = PathBuf::from("/root/main.beancount");
 
@@ -290,7 +380,7 @@ mod tests {
 
     #[test]
     fn test_parse_stderr_output_line_zero() {
-        let checker = SystemCallChecker::new(PathBuf::from("bean-check"));
+        let checker = SystemCallChecker::new(PathBuf::from("bean-check"), std::time::Duration::from_secs(30));
         let stderr = b"<check_commodity>:0: Missing Commodity directive for 'USD'";
         let root_file = PathBuf::from("/root/main.beancount");
 
@@ -304,7 +394,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn test_parse_windows_balance_error() {
-        let checker = SystemCallChecker::new(PathBuf::from("bean-check"));
+        let checker = SystemCallChecker::new(PathBuf::from("bean-check"), std::time::Duration::from_secs(30));
         let stderr = b"C:\\Users\\TestUser\\projects\\example\\2026\\main.bean:109: Balance failed for 'Liabilities:Card': expected -13954.35 CNY != accumulated -3954.35 CNY (10000.00 too much)\r\n\r\n   2026-01-10 balance Liabilities:Card                             -13954.35 CNY\r\n";
         let root_file = PathBuf::from("C:/Users/TestUser/projects/example/2026/main.bean");
 
@@ -359,7 +449,7 @@ mod tests {
 
     #[test]
     fn test_split_fallback_allows_extra_colon_in_path() {
-        let checker = SystemCallChecker::new(PathBuf::from("bean-check"));
+        let checker = SystemCallChecker::new(PathBuf::from("bean-check"), std::time::Duration::from_secs(30));
         let stderr = b"C:/weird:path/01.bean:12: extra colon path";
         let root_file = PathBuf::from("C:/weird:path/01.bean");
 
@@ -376,7 +466,7 @@ mod tests {
         // Try to find bean-check in PATH
         let bean_check_cmd =
             which::which("bean-check").unwrap_or_else(|_| PathBuf::from("bean-check"));
-        let checker = SystemCallChecker::new(bean_check_cmd);
+        let checker = SystemCallChecker::new(bean_check_cmd, std::time::Duration::from_secs(30));
 
         // Skip if bean-check not available
         if !checker.is_available() {
@@ -400,7 +490,7 @@ mod tests {
     fn test_system_call_checker_integration_with_errors() {
         let bean_check_cmd =
             which::which("bean-check").unwrap_or_else(|_| PathBuf::from("bean-check"));
-        let checker = SystemCallChecker::new(bean_check_cmd);
+        let checker = SystemCallChecker::new(bean_check_cmd, std::time::Duration::from_secs(30));
 
         if !checker.is_available() {
             return;
@@ -433,7 +523,7 @@ mod tests {
     fn test_system_call_checker_integration_balance_failure() {
         let bean_check_cmd =
             which::which("bean-check").unwrap_or_else(|_| PathBuf::from("bean-check"));
-        let checker = SystemCallChecker::new(bean_check_cmd);
+        let checker = SystemCallChecker::new(bean_check_cmd, std::time::Duration::from_secs(30));
 
         if !checker.is_available() {
             return;
@@ -473,7 +563,7 @@ mod tests {
     fn test_system_call_checker_integration_line_numbers() {
         let bean_check_cmd =
             which::which("bean-check").unwrap_or_else(|_| PathBuf::from("bean-check"));
-        let checker = SystemCallChecker::new(bean_check_cmd);
+        let checker = SystemCallChecker::new(bean_check_cmd, std::time::Duration::from_secs(30));
 
         if !checker.is_available() {
             return;

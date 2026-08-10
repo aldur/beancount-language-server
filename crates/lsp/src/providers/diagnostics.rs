@@ -337,12 +337,13 @@ mod tests {
     #[test]
     fn test_diagnostics_no_errors() {
         use crate::checkers::SystemCallChecker;
+        use std::time::Duration;
 
         let (_temp_dir, file_path) =
             create_temp_beancount_file("2023-01-01 open Assets:Cash\n2023-01-01 close Assets:Cash");
         let beancount_data = HashMap::new();
         let mock_bean_check = create_mock_bean_check_success();
-        let checker = SystemCallChecker::new(mock_bean_check);
+        let checker = SystemCallChecker::new(mock_bean_check, std::time::Duration::from_secs(30));
 
         let result = diagnostics(&beancount_data, &checker, &file_path, &["!".to_string()]);
 
@@ -355,11 +356,12 @@ mod tests {
     #[test]
     fn test_diagnostics_bean_check_errors() {
         use crate::checkers::SystemCallChecker;
+        use std::time::Duration;
 
         let (_temp_dir, file_path) = create_temp_beancount_file("invalid beancount syntax");
         let beancount_data = HashMap::new();
         let mock_bean_check = create_mock_bean_check_with_errors();
-        let checker = SystemCallChecker::new(mock_bean_check);
+        let checker = SystemCallChecker::new(mock_bean_check, std::time::Duration::from_secs(30));
 
         let result = diagnostics(&beancount_data, &checker, &file_path, &["!".to_string()]);
 
@@ -374,13 +376,14 @@ mod tests {
     #[test]
     fn test_diagnostics_flagged_entries() {
         use crate::checkers::SystemCallChecker;
+        use std::time::Duration;
 
         let flagged_content =
             "2023-01-01 ! \"Flagged transaction\"\n  Assets:Cash 100 USD\n  Expenses:Food";
         let (_temp_dir, file_path) = create_temp_beancount_file(flagged_content);
         let beancount_data = create_mock_beancount_data_with_flags(&file_path, flagged_content);
         let mock_bean_check = create_mock_bean_check_success();
-        let checker = SystemCallChecker::new(mock_bean_check);
+        let checker = SystemCallChecker::new(mock_bean_check, std::time::Duration::from_secs(30));
 
         let result = diagnostics(&beancount_data, &checker, &file_path, &["!".to_string()]);
 
@@ -419,12 +422,13 @@ mod tests {
     #[test]
     fn test_diagnostics_combined_errors_and_flags() {
         use crate::checkers::SystemCallChecker;
+        use std::time::Duration;
 
         let flagged_content = "2023-01-01 ! \"Test\"\n  Assets:Cash\n  Expenses:Food";
         let (_temp_dir, file_path) = create_temp_beancount_file(flagged_content);
         let beancount_data = create_mock_beancount_data_with_flags(&file_path, flagged_content);
         let mock_bean_check = create_mock_bean_check_with_errors();
-        let checker = SystemCallChecker::new(mock_bean_check);
+        let checker = SystemCallChecker::new(mock_bean_check, std::time::Duration::from_secs(30));
 
         let result = diagnostics(&beancount_data, &checker, &file_path, &["!".to_string()]);
 
@@ -456,11 +460,12 @@ mod tests {
     #[test]
     fn test_diagnostics_invalid_bean_check_command() {
         use crate::checkers::SystemCallChecker;
+        use std::time::Duration;
 
         let (_temp_dir, file_path) = create_temp_beancount_file("test content");
         let beancount_data = HashMap::new();
         let invalid_command = PathBuf::from("/nonexistent/command/that/does/not/exist");
-        let checker = SystemCallChecker::new(invalid_command);
+        let checker = SystemCallChecker::new(invalid_command, std::time::Duration::from_secs(30));
 
         let result = diagnostics(&beancount_data, &checker, &file_path, &["!".to_string()]);
 
@@ -473,11 +478,12 @@ mod tests {
     #[test]
     fn test_diagnostics_malformed_error_output() {
         use crate::checkers::SystemCallChecker;
+        use std::time::Duration;
 
         let (_temp_dir, file_path) = create_temp_beancount_file("test content");
         let beancount_data = HashMap::new();
         let mock_bean_check = create_mock_bean_check_with_errors();
-        let checker = SystemCallChecker::new(mock_bean_check);
+        let checker = SystemCallChecker::new(mock_bean_check, std::time::Duration::from_secs(30));
 
         let result = diagnostics(&beancount_data, &checker, &file_path, &["!".to_string()]);
 
@@ -491,6 +497,7 @@ mod tests {
     #[test]
     fn test_diagnostics_multiple_files() {
         use crate::checkers::SystemCallChecker;
+        use std::time::Duration;
 
         let (_temp_dir1, file_path1) = create_temp_beancount_file("content1");
         let (_temp_dir2, file_path2) = create_temp_beancount_file("content2");
@@ -504,7 +511,7 @@ mod tests {
         beancount_data.extend(create_mock_beancount_data_with_flags(&file_path2, content2));
 
         let mock_bean_check = create_mock_bean_check_success();
-        let checker = SystemCallChecker::new(mock_bean_check);
+        let checker = SystemCallChecker::new(mock_bean_check, std::time::Duration::from_secs(30));
 
         let result = diagnostics(&beancount_data, &checker, &file_path1, &["!".to_string()]);
 
@@ -551,11 +558,12 @@ mod tests {
     #[test]
     fn test_diagnostics_empty_beancount_data() {
         use crate::checkers::SystemCallChecker;
+        use std::time::Duration;
 
         let (_temp_dir, file_path) = create_temp_beancount_file("empty");
         let beancount_data = HashMap::new(); // No beancount data
         let mock_bean_check = create_mock_bean_check_success();
-        let checker = SystemCallChecker::new(mock_bean_check);
+        let checker = SystemCallChecker::new(mock_bean_check, std::time::Duration::from_secs(30));
 
         let result = diagnostics(&beancount_data, &checker, &file_path, &["!".to_string()]);
 
@@ -568,11 +576,12 @@ mod tests {
     #[test]
     fn test_diagnostic_position_conversion() {
         use crate::checkers::SystemCallChecker;
+        use std::time::Duration;
 
         let (_temp_dir, file_path) = create_temp_beancount_file("test");
         let beancount_data = HashMap::new();
         let mock_bean_check = create_mock_bean_check_success();
-        let checker = SystemCallChecker::new(mock_bean_check);
+        let checker = SystemCallChecker::new(mock_bean_check, std::time::Duration::from_secs(30));
 
         let result = diagnostics(&beancount_data, &checker, &file_path, &["!".to_string()]);
 
@@ -606,6 +615,7 @@ mod tests {
     #[test]
     fn test_configurable_diagnostic_flags_default() {
         use crate::checkers::SystemCallChecker;
+        use std::time::Duration;
 
         // Test with only '!' flag (default configuration)
         let flagged_content = r#"2023-01-01 ! "Needs attention"
@@ -619,7 +629,7 @@ mod tests {
         let (_temp_dir, file_path) = create_temp_beancount_file(flagged_content);
         let beancount_data = create_mock_beancount_data_with_flags(&file_path, flagged_content);
         let mock_bean_check = create_mock_bean_check_success();
-        let checker = SystemCallChecker::new(mock_bean_check);
+        let checker = SystemCallChecker::new(mock_bean_check, std::time::Duration::from_secs(30));
 
         // Test with default config (only '!' flag)
         let result = diagnostics(&beancount_data, &checker, &file_path, &["!".to_string()]);
@@ -643,6 +653,7 @@ mod tests {
     #[test]
     fn test_configurable_diagnostic_flags_multiple() {
         use crate::checkers::SystemCallChecker;
+        use std::time::Duration;
 
         // Test with multiple flags configured
         let flagged_content = r#"2023-01-01 ! "Needs attention"
@@ -656,7 +667,7 @@ mod tests {
         let (_temp_dir, file_path) = create_temp_beancount_file(flagged_content);
         let beancount_data = create_mock_beancount_data_with_flags(&file_path, flagged_content);
         let mock_bean_check = create_mock_bean_check_success();
-        let checker = SystemCallChecker::new(mock_bean_check);
+        let checker = SystemCallChecker::new(mock_bean_check, std::time::Duration::from_secs(30));
 
         // Test with both '!' and 'P' flags configured
         let result = diagnostics(
@@ -681,6 +692,7 @@ mod tests {
     #[test]
     fn test_configurable_diagnostic_flags_empty() {
         use crate::checkers::SystemCallChecker;
+        use std::time::Duration;
 
         // Test with empty diagnostic_flags (no flags should generate diagnostics)
         let flagged_content = r#"2023-01-01 ! "Needs attention"
@@ -690,7 +702,7 @@ mod tests {
         let (_temp_dir, file_path) = create_temp_beancount_file(flagged_content);
         let beancount_data = create_mock_beancount_data_with_flags(&file_path, flagged_content);
         let mock_bean_check = create_mock_bean_check_success();
-        let checker = SystemCallChecker::new(mock_bean_check);
+        let checker = SystemCallChecker::new(mock_bean_check, std::time::Duration::from_secs(30));
 
         // Test with empty diagnostic_flags
         let result = diagnostics(&beancount_data, &checker, &file_path, &[]);
@@ -750,7 +762,8 @@ mod tests {
 
         // CheckerDiagnosticSource uses a real checker but we can use /bin/true
         use crate::checkers::SystemCallChecker;
-        let checker = SystemCallChecker::new(create_mock_bean_check_success());
+        use std::time::Duration;
+        let checker = SystemCallChecker::new(create_mock_bean_check_success(), Duration::from_secs(30));
         let source = CheckerDiagnosticSource {
             checker: &checker,
             root_journal_file: &file_path,

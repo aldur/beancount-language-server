@@ -93,6 +93,8 @@ pub struct BeancountCheckConfig {
     pub bean_check_cmd: Option<PathBuf>,
     /// Path to Python executable (for Python method)
     pub python_cmd: Option<PathBuf>,
+    /// Kill a bean-check run that exceeds this many seconds.
+    pub timeout_secs: u64,
 }
 
 impl Default for BeancountCheckConfig {
@@ -107,6 +109,7 @@ impl BeancountCheckConfig {
             method: None, // None means auto-discovery
             bean_check_cmd: None,
             python_cmd: None,
+            timeout_secs: 120,
         }
     }
 }
@@ -280,7 +283,10 @@ fn create_system_call_checker(config: &BeancountCheckConfig, root_dir: &Path) ->
             .clone()
             .unwrap_or_else(|| PathBuf::from("bean-check"))
     });
-    SystemCallChecker::new(bean_check_cmd)
+    SystemCallChecker::new(
+        bean_check_cmd,
+        std::time::Duration::from_secs(config.timeout_secs.max(1)),
+    )
 }
 
 /// An ordered list of checker candidates; returns the first available one.
@@ -614,6 +620,7 @@ mod tests {
             method: None,
             bean_check_cmd: None,
             python_cmd: Some(PathBuf::from("/config/python")),
+            timeout_secs: 120,
         };
 
         let result = resolve_python_cmd(&config, temp_dir.path());
@@ -650,6 +657,7 @@ mod tests {
             method: None,
             bean_check_cmd: None,
             python_cmd: Some(PathBuf::from("/custom/python")),
+            timeout_secs: 120,
         };
 
         let temp_dir = TempDir::new().unwrap();
@@ -673,6 +681,7 @@ mod tests {
             method: None,
             bean_check_cmd: None,
             python_cmd: Some(PathBuf::from("")),
+            timeout_secs: 120,
         };
 
         use tempfile::TempDir;
@@ -705,6 +714,7 @@ mod tests {
                 method: None,
                 bean_check_cmd: None,
                 python_cmd: None,
+                timeout_secs: 120,
             };
             let result = resolve_python_cmd(&config, temp_dir.path());
 
@@ -720,6 +730,7 @@ mod tests {
             method: None,
             bean_check_cmd: Some(PathBuf::from("/custom/bean-check")),
             python_cmd: None,
+            timeout_secs: 120,
         };
 
         use tempfile::TempDir;
@@ -751,6 +762,7 @@ mod tests {
                 method: None,
                 bean_check_cmd: None,
                 python_cmd: None,
+                timeout_secs: 120,
             };
 
             let result = resolve_bean_check_cmd(&config, temp_dir.path());
@@ -780,6 +792,7 @@ mod tests {
                 method: None,
                 bean_check_cmd: None,
                 python_cmd: None,
+                timeout_secs: 120,
             };
 
             let result = resolve_bean_check_cmd(&config, temp_dir.path());
@@ -802,6 +815,7 @@ mod tests {
             method: None,
             bean_check_cmd: None,
             python_cmd: Some(PathBuf::from("/nonexistent/python")),
+            timeout_secs: 120,
         };
 
         let result = create_python_checker(&config, Path::new("."));
@@ -816,6 +830,7 @@ mod tests {
             method: Some(BeancountCheckMethod::PythonEmbedded),
             bean_check_cmd: Some(PathBuf::from("/nonexistent/bean-check")),
             python_cmd: Some(PathBuf::from("/nonexistent/python")),
+            timeout_secs: 120,
         };
 
         let checker = create_checker(&config, Path::new("."));
