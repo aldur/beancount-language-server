@@ -80,38 +80,44 @@ impl DocumentStore {
                 .expect("Failed to set language for tree-sitter parser");
             parser
         });
-        let parser = self
-            .parsers
-            .get_mut(&uri)
-            .expect("parser should exist after insertion");
 
-        // A parse can fail (or be cancelled by its budget): keep the buffer,
-        // leave the file out of the forest, and let providers decline rather
-        // than panicking the main loop.
-        let parsed = parse_with_budget(parser, text, None).filter(|tree| {
-            if tree_depth_exceeds(tree, MAX_TREE_DEPTH) {
-                tracing::warn!("Parse tree for {:?} is pathologically deep", uri);
-                false
-            } else {
-                true
-            }
-        });
-        let Some(tree) = parsed else {
-            tracing::warn!("Failed to parse {:?}; not adding it to the forest", uri);
-            Arc::make_mut(&mut self.forest).remove(&uri);
-            Arc::make_mut(&mut self.beancount_data).remove(&uri);
-            Arc::make_mut(&mut self.forest_content).remove(&uri);
-            return;
-        };
-        let tree = Arc::new(tree);
-
-        Arc::make_mut(&mut self.forest).insert(uri.clone(), tree);
-        // Semantic extraction is scheduled by the caller, never done here:
-        // it is unbounded work (measured at 8s for a 100kB pathological file)
-        // and this runs in the didOpen handler on the main loop.
+        // Neither the parse nor the extraction happens here: a full parse of a
+        // multi-megabyte ledger takes seconds, and this runs in the didOpen
+        // handler on the main loop. The caller schedules both, and anything
+        // that needs a tree declines until it lands.
+        Arc::make_mut(&mut self.forest).remove(&uri);
         Arc::make_mut(&mut self.beancount_data).remove(&uri);
-        // open_docs is now the source of truth for this file's content
         Arc::make_mut(&mut self.forest_content).remove(&uri);
+    }
+
+    /// Install a tree parsed off-thread, unless the document moved on.
+    ///
+    /// Returns true when the tree was installed.
+    pub(crate) fn install_tree(
+        &mut self,
+        uri: &PathBuf,
+        tree: Arc<tree_sitter::Tree>,
+        version: i32,
+    ) -> bool {
+        let current = match self.open_docs.get(uri) {
+            Some(doc) => doc.version,
+            None => return false,
+        };
+        if current != version {
+            tracing::trace!(
+                "Dropping tree for {:?}: parsed at v{version}, document at v{current}",
+                uri
+            );
+            return false;
+        }
+        Arc::make_mut(&mut self.forest).insert(uri.clone(), tree);
+        true
+    }
+
+    /// The text and version to parse off-thread.
+    pub(crate) fn parse_inputs(&self, uri: &PathBuf) -> Option<(String, i32)> {
+        let doc = self.open_docs.get(uri)?;
+        Some((doc.text_string(), doc.version))
     }
 
     /// Apply incremental content changes to an open document.
@@ -223,23 +229,10 @@ impl DocumentStore {
         // Step 3 — clone the old tree (applying ts_edits) and snapshot the text.
         // Both borrows are released before step 4 mutates `parsers`.
         //
-        // No tree means an earlier parse failed or was rejected; re-parse from
-        // scratch so the document can recover once the user fixes it, instead
-        // of staying unsupported until it is closed and reopened.
+        // No tree yet (the initial parse is still in flight, or an earlier one
+        // failed): the rope is updated, and `did_change` schedules a parse.
+        // Never parse from scratch here — that is main-loop work.
         if !self.forest.contains_key(uri) {
-            let text = self
-                .open_docs
-                .get(uri)
-                .map(|doc| doc.text_string())
-                .unwrap_or_default();
-            if let Some(parser) = self.parsers.get_mut(uri)
-                && let Some(tree) =
-                    parse_with_budget(parser, &text, None).filter(|t| !tree_depth_exceeds(t, MAX_TREE_DEPTH))
-            {
-                Arc::make_mut(&mut self.forest).insert(uri.clone(), Arc::new(tree));
-                Arc::make_mut(&mut self.beancount_data).remove(uri);
-                tracing::debug!("Recovered a parse tree for {:?}", uri);
-            }
             return Ok(());
         }
         let (edited_old_tree, text_str) = {
@@ -540,6 +533,14 @@ mod tests {
 
     const CONTENT: &str = "2024-01-01 open Assets:Checking USD\n";
 
+    /// Open a document and land its parse and semantic data, the way the
+    /// scheduler does asynchronously in the running server.
+    fn open_parsed(store: &mut DocumentStore, uri: &PathBuf, text: &str, version: i32) {
+        store.open(uri.clone(), text, version);
+        assert!(store.install_tree(uri, Arc::new(parse(text)), version));
+        store.ensure_beancount_data(uri);
+    }
+
     #[test]
     fn test_open_populates_all_maps() {
         let mut store = DocumentStore::new();
@@ -547,13 +548,17 @@ mod tests {
 
         store.open(uri.clone(), CONTENT, 1);
 
+        // Parsing and extraction are scheduled by the caller, off the main
+        // loop, so open() alone yields a buffer and nothing else.
         assert!(store.open_docs.contains_key(&uri));
-        assert!(store.get_tree(&uri).is_some());
         assert_eq!(store.open_docs.get(&uri).unwrap().version, 1);
-        // Semantic data is built off the main loop, so it is absent until the
-        // scheduled extraction lands.
+        assert!(store.get_tree(&uri).is_none());
         assert!(!store.beancount_data.contains_key(&uri));
+
+        // Once the scheduled work lands, the maps are populated.
+        assert!(store.install_tree(&uri, Arc::new(parse(CONTENT)), 1));
         store.ensure_beancount_data(&uri);
+        assert!(store.get_tree(&uri).is_some());
         assert!(store.beancount_data.contains_key(&uri));
     }
 
@@ -561,8 +566,7 @@ mod tests {
     fn test_apply_change_keeps_previous_semantic_data() {
         let mut store = DocumentStore::new();
         let uri = PathBuf::from("/test/file.beancount");
-        store.open(uri.clone(), CONTENT, 1);
-        store.ensure_beancount_data(&uri);
+        open_parsed(&mut store, &uri, CONTENT, 1);
 
         #[allow(deprecated)]
         let change = lsp_types::TextDocumentContentChangeEvent::TextDocumentContentChangePartial(
@@ -589,7 +593,7 @@ mod tests {
     fn test_apply_change_updates_content_and_version() {
         let mut store = DocumentStore::new();
         let uri = PathBuf::from("/test/file.beancount");
-        store.open(uri.clone(), "hello", 1);
+        open_parsed(&mut store, &uri, "hello", 1);
 
         #[allow(deprecated)]
         let change = lsp_types::TextDocumentContentChangeEvent::TextDocumentContentChangePartial(
@@ -635,7 +639,7 @@ mod tests {
         // and desynced the tree-sitter edits.
         let mut store = DocumentStore::new();
         let uri = PathBuf::from("/test/file.beancount");
-        store.open(uri.clone(), "2024-01-01 open Assets:Cash\n", 1);
+        open_parsed(&mut store, &uri, "2024-01-01 open Assets:Cash\n", 1);
 
         let changes = vec![
             partial((1, 0), (1, 0), "line1\nline2\nline3\n"),
@@ -659,8 +663,9 @@ mod tests {
         // byte ranges — diverge from a fresh parse of the same text.
         let mut store = DocumentStore::new();
         let uri = PathBuf::from("/test/file.beancount");
-        store.open(
-            uri.clone(),
+        open_parsed(
+            &mut store,
+            &uri,
             "2024-01-02 * \"Café ☕\" \"Espresso\"\n  Expenses:Caffè  2.50 EUR\n  Assets:Bank:Checking\n",
             1,
         );
@@ -699,7 +704,7 @@ mod tests {
         // panic the main loop.
         let mut store = DocumentStore::new();
         let uri = PathBuf::from("/test/file.beancount");
-        store.open(uri.clone(), "2024-01-01 open Assets:Cash\n", 1);
+        open_parsed(&mut store, &uri, "2024-01-01 open Assets:Cash\n", 1);
 
         let changes = vec![partial((0, 9), (0, 2), "X")];
         store.apply_change(&uri, &changes, 2).unwrap();
@@ -711,7 +716,7 @@ mod tests {
         // instead of panicking the main loop.
         let mut store = DocumentStore::new();
         let uri = PathBuf::from("/test/file.beancount");
-        store.open(uri.clone(), "2024-01-01 open Assets:Cash\n", 1);
+        open_parsed(&mut store, &uri, "2024-01-01 open Assets:Cash\n", 1);
 
         let changes = vec![partial((99, 7), (99, 9), "; tail")];
         store.apply_change(&uri, &changes, 2).unwrap();
@@ -724,7 +729,7 @@ mod tests {
     fn test_close_transitions_to_non_open_forest_file() {
         let mut store = DocumentStore::new();
         let uri = PathBuf::from("/test/file.beancount");
-        store.open(uri.clone(), CONTENT, 1);
+        open_parsed(&mut store, &uri, CONTENT, 1);
 
         store.close(&uri);
 
@@ -743,11 +748,11 @@ mod tests {
     fn test_reopen_after_close_gets_fresh_state() {
         let mut store = DocumentStore::new();
         let uri = PathBuf::from("/test/file.beancount");
-        store.open(uri.clone(), CONTENT, 1);
+        open_parsed(&mut store, &uri, CONTENT, 1);
         store.close(&uri);
 
         let new_content = "2024-06-01 open Liabilities:CreditCard USD\n";
-        store.open(uri.clone(), new_content, 2);
+        open_parsed(&mut store, &uri, new_content, 2);
 
         let doc = store.open_docs.get(&uri).unwrap();
         assert_eq!(doc.version, 2);
@@ -760,7 +765,7 @@ mod tests {
     fn test_ensure_beancount_data_lazy_extraction() {
         let mut store = DocumentStore::new();
         let uri = PathBuf::from("/test/file.beancount");
-        store.open(uri.clone(), CONTENT, 1);
+        open_parsed(&mut store, &uri, CONTENT, 1);
 
         // Data absent but tree present: the fallback must rebuild it.
         Arc::make_mut(&mut store.beancount_data).remove(&uri);
@@ -775,7 +780,7 @@ mod tests {
         // Data built off-thread must not overwrite a newer document's data.
         let mut store = DocumentStore::new();
         let uri = PathBuf::from("/test/file.beancount");
-        store.open(uri.clone(), CONTENT, 1);
+        open_parsed(&mut store, &uri, CONTENT, 1);
         let (tree, rope, version) = store.extraction_inputs(&uri).unwrap();
         assert_eq!(version, 1);
         let fresh = Arc::new(BeancountData::new(&tree, &rope));
@@ -786,6 +791,7 @@ mod tests {
 
         // Older version than the document: dropped.
         store.open(uri.clone(), CONTENT, 5);
+        assert!(store.install_tree(&uri, Arc::new(parse(CONTENT)), 5));
         store.install_beancount_data(&uri, fresh.clone(), 1);
         assert!(!store.beancount_data.contains_key(&uri));
 
@@ -802,8 +808,7 @@ mod tests {
     fn test_ensure_beancount_data_skips_if_present() {
         let mut store = DocumentStore::new();
         let uri = PathBuf::from("/test/file.beancount");
-        store.open(uri.clone(), CONTENT, 1);
-        store.ensure_beancount_data(&uri);
+        open_parsed(&mut store, &uri, CONTENT, 1);
 
         let first_ptr = Arc::as_ptr(store.beancount_data.get(&uri).unwrap());
         store.ensure_beancount_data(&uri);
@@ -926,7 +931,7 @@ mod tests {
         let mut store = DocumentStore::new();
         let content = std::fs::read_to_string(&root).unwrap();
         store.insert_parsed(root.clone(), parse(&content), &content);
-        store.open(open_file.clone(), "2020-01-01 open Assets:Open\n", 1);
+        open_parsed(&mut store, &open_file, "2020-01-01 open Assets:Open\n", 1);
 
         let pruned = store.retain_reachable(&root);
 
@@ -938,9 +943,8 @@ mod tests {
     fn test_snapshot_maps_clones_all_maps() {
         let mut store = DocumentStore::new();
         let uri = PathBuf::from("/test/file.beancount");
-        store.open(uri.clone(), CONTENT, 1);
+        open_parsed(&mut store, &uri, CONTENT, 1);
 
-        store.ensure_beancount_data(&uri);
         let maps = store.snapshot_maps();
 
         assert!(maps.open_docs.contains_key(&uri));
@@ -957,7 +961,7 @@ mod tests {
         // not clone the underlying HashMaps.
         let mut store = DocumentStore::new();
         let uri = PathBuf::from("/test/file.beancount");
-        store.open(uri.clone(), CONTENT, 1);
+        open_parsed(&mut store, &uri, CONTENT, 1);
 
         let maps1 = store.snapshot_maps();
         let maps2 = store.snapshot_maps();
@@ -986,13 +990,13 @@ mod tests {
         // (copy-on-write: make_mut allocates a new HashMap).
         let mut store = DocumentStore::new();
         let uri = PathBuf::from("/test/file.beancount");
-        store.open(uri.clone(), CONTENT, 1);
+        open_parsed(&mut store, &uri, CONTENT, 1);
 
         let snapshot_before = store.snapshot_maps();
 
         // Mutate by inserting another key
         let uri2 = PathBuf::from("/test/file2.beancount");
-        store.open(uri2.clone(), CONTENT, 1);
+        open_parsed(&mut store, &uri2, CONTENT, 1);
 
         // snapshot_before should still point to the old allocation
         assert!(

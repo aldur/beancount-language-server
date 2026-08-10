@@ -29,12 +29,8 @@ fn process_includes(
     }
     processed.insert(file_path.clone());
 
-    let tree = match state.doc_store.get_tree(file_path) {
-        Some(tree) => tree.clone(),
-        None => return Ok(()),
-    };
-    // The text the tree was parsed from — for an open document that is the
-    // buffer, which can differ from the file on disk.
+    // Text only: include directives are scanned from the text, so this works
+    // before the document has been parsed.
     let text = match state.doc_store.get_content(file_path) {
         Some(text) => text,
         None => return Ok(()),
@@ -45,7 +41,6 @@ fn process_includes(
     processed.extend(known);
 
     forest::parse_reachable_includes(
-        &tree,
         file_path,
         &text,
         processed,
@@ -84,8 +79,9 @@ pub(crate) fn did_open(
     if let Err(e) = process_includes(state, &uri, &mut processed) {
         debug!("Error processing includes for {:?}: {}", uri, e);
     }
-    // The opened buffer and any newly discovered includes have trees but no
-    // semantic data yet; build it on the pool.
+    // Parse the buffer and extract semantics for it and any newly discovered
+    // includes — all on the pool.
+    state.schedule_parse(&uri);
     state.schedule_missing_extractions();
 
     let snapshot = state.snapshot();
@@ -314,8 +310,13 @@ pub(crate) fn did_change(
     // Rebuild semantic data off the main loop: a full extraction pass over a
     // large ledger takes hundreds of milliseconds, and doing it here (or
     // lazily in `snapshot`, which every request calls) blocked the server on
-    // every keystroke.
-    state.schedule_extraction(&uri);
+    // every keystroke. Without a tree yet, the edit only updated the rope, so
+    // a full parse has to be scheduled instead.
+    if state.doc_store.get_tree(&uri).is_some() {
+        state.schedule_extraction(&uri);
+    } else {
+        state.schedule_parse(&uri);
+    }
 
     debug!("text_document::did_change - done");
     Ok(())

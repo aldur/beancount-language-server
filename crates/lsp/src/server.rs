@@ -61,6 +61,12 @@ pub(crate) enum Task {
     Response(lsp_server::Response),
     Notify(lsp_server::Notification),
     Progress(ProgressMsg),
+    /// A document parsed on the thread pool.
+    Parsed {
+        path: PathBuf,
+        version: i32,
+        tree: Option<Arc<tree_sitter::Tree>>,
+    },
     /// Semantic data rebuilt on the thread pool after an edit.
     SemanticData {
         path: PathBuf,
@@ -119,6 +125,9 @@ pub(crate) struct LspServerState {
     /// keystroke: at most one runs per file, and it re-checks the document
     /// version when it lands.
     pub extracting: std::collections::HashSet<PathBuf>,
+
+    /// Files with a parse in flight, for the same reason as `extracting`.
+    pub parsing: std::collections::HashSet<PathBuf>,
 
     // Cached checker instance (created once and reused)
     pub checker_registry: CheckerRegistry,
@@ -188,6 +197,7 @@ impl LspServerState {
             task_receiver,
             thread_pool: threadpool::ThreadPool::default(),
             extracting: std::collections::HashSet::new(),
+            parsing: std::collections::HashSet::new(),
             checker_registry: CheckerRegistry::new(),
             request_router,
         }
@@ -315,6 +325,30 @@ impl LspServerState {
             Task::Progress(progress_task) => {
                 tracing::debug!("Handling progress task: {:?}", progress_task);
                 self.handle_progress_task(progress_task)?;
+            }
+            Task::Parsed {
+                path,
+                version,
+                tree,
+            } => {
+                self.parsing.remove(&path);
+                match tree {
+                    Some(tree) => {
+                        if self.doc_store.install_tree(&path, tree, version) {
+                            // A tree without semantic data is only half useful.
+                            self.schedule_extraction(&path);
+                        }
+                    }
+                    None => tracing::warn!("Failed to parse {:?}", path),
+                }
+                // The document moved on while it was being parsed.
+                if self
+                    .doc_store
+                    .parse_inputs(&path)
+                    .is_some_and(|(_, current)| current != version)
+                {
+                    self.schedule_parse(&path);
+                }
             }
             Task::SemanticData {
                 path,
@@ -531,6 +565,32 @@ impl LspServerState {
 
     /// Rebuild a file's semantic data on the thread pool, at most one at a
     /// time per file.
+    /// Parse a document on the thread pool, at most one parse per file.
+    ///
+    /// A full parse of a multi-megabyte ledger takes seconds; doing it in the
+    /// notification handler blocks every buffer and every request.
+    pub(crate) fn schedule_parse(&mut self, uri: &PathBuf) {
+        if self.parsing.contains(uri) {
+            return;
+        }
+        let Some((text, version)) = self.doc_store.parse_inputs(uri) else {
+            return;
+        };
+        self.parsing.insert(uri.clone());
+        let sender = self.task_sender.clone();
+        let path = uri.clone();
+        self.thread_pool.execute(move || {
+            let tree = crate::treesitter_utils::parse_beancount(&text).map(Arc::new);
+            if let Err(e) = sender.send(Task::Parsed {
+                path,
+                version,
+                tree,
+            }) {
+                tracing::debug!("Failed to deliver parse result: {e}");
+            }
+        });
+    }
+
     /// Schedule rebuilds for every forest file that has no semantic data yet.
     pub(crate) fn schedule_missing_extractions(&mut self) {
         for path in self.doc_store.files_missing_data() {

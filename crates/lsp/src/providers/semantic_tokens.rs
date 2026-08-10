@@ -134,6 +134,44 @@ pub(crate) fn semantic_tokens_full(
     }))
 }
 
+/// Timing hook for the bench harness.
+#[cfg(test)]
+pub(crate) fn bench_collect(
+    tree: &tree_sitter_beancount::tree_sitter::Tree,
+    content: &Rope,
+) -> usize {
+    let mut out = Vec::new();
+    collect_tokens(&tree.root_node(), content, &mut out, 0);
+    out.len()
+}
+
+/// Walk every node doing only the rope position conversions, to separate
+/// conversion cost from walk cost.
+#[cfg(test)]
+pub(crate) fn bench_positions(
+    tree: &tree_sitter_beancount::tree_sitter::Tree,
+    content: &Rope,
+) -> usize {
+    let mut cursor = tree.walk();
+    let mut n = 0usize;
+    loop {
+        let node = cursor.node();
+        let _ = to_semantic_token(&node, content, TokenKind::String);
+        n += 1;
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return n;
+            }
+        }
+    }
+}
+
 fn collect_tokens(node: &Node, content: &Rope, out: &mut Vec<RawToken>, depth: usize) {
     if depth > crate::treesitter_utils::MAX_TREE_DEPTH {
         tracing::warn!("semantic tokens: tree deeper than the walk limit, truncating");

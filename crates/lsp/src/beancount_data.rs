@@ -839,6 +839,15 @@ mod bench {
             data.get_accounts().len()
         );
 
+        // provider-level costs on the same document
+        let t = Instant::now();
+        let toks = crate::providers::semantic_tokens::bench_collect(&tree, &rope);
+        eprintln!("collect_tokens:   {:?} ({toks} tokens)", t.elapsed());
+
+        let t = Instant::now();
+        let n = crate::providers::semantic_tokens::bench_positions(&tree, &rope);
+        eprintln!("position convs:   {:?} ({n} nodes)", t.elapsed());
+
         let t = Instant::now();
         let mut count = 0usize;
         let mut cursor = tree.walk();

@@ -147,15 +147,12 @@ pub(crate) fn extract_include_paths(text: &str, containing_file: &path::Path) ->
 
 /// Parse all files reachable via `include` directives starting from `tree`/`file`.
 ///
-/// `text` must be the source `tree` was parsed from — the editor buffer for an
-/// open document, not the file on disk: the two can differ (unsaved changes),
-/// and slicing the tree's byte ranges out of the wrong bytes walks out of
-/// bounds.
+/// `text` must be the buffer for an open document rather than the file on
+/// disk: the two differ while there are unsaved changes.
 ///
 /// Calls `on_parsed` for each newly discovered file. Pre-populate `already_seen`
 /// with paths to skip (e.g. already loaded in DocumentStore).
 pub(crate) fn parse_reachable_includes(
-    tree: &tree_sitter::Tree,
     file: &path::Path,
     text: &str,
     already_seen: &mut HashSet<PathBuf>,
