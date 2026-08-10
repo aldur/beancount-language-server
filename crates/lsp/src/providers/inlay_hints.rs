@@ -303,17 +303,14 @@ fn extract_amount_from_node(
     if !number_str.is_empty() && !currency_str.is_empty() {
         // Strip comma thousands separators before parsing (beancount allows them)
         let number_str = number_str.replace(',', "");
-        // Try to evaluate the expression if it's a calculation
-        let value = if number_str.contains('*')
-            || number_str.contains('+')
-            || (number_str.contains('-') && number_str.matches('-').count() > 1)
-        {
-            // For binary expressions, try to evaluate them
-            evaluate_expression(&number_str)
-                .or_else(|| rust_decimal::Decimal::from_str_exact(&number_str).ok())?
-        } else {
-            rust_decimal::Decimal::from_str_exact(&number_str).ok()?
-        };
+        // A plain literal first, then arithmetic. The previous sniffing
+        // ("contains * or + or more than one -") misread `5-3` and `10/2` as
+        // literals, failed to parse them, and reported the posting as having
+        // no amount at all — which moves the balancing hint to the wrong
+        // posting and computes it without this posting's value.
+        let value = rust_decimal::Decimal::from_str_exact(&number_str)
+            .ok()
+            .or_else(|| evaluate_expression(&number_str))?;
         Some(Amount {
             value,
             currency: currency_str,
@@ -399,17 +396,14 @@ fn extract_compound_amount(
     if !number_str.is_empty() && !currency_str.is_empty() {
         // Strip comma thousands separators before parsing (beancount allows them)
         let number_str = number_str.replace(',', "");
-        // Try to evaluate the expression if it's a calculation
-        let value = if number_str.contains('*')
-            || number_str.contains('+')
-            || number_str.contains('-') && number_str.matches('-').count() > 1
-        {
-            // For binary expressions, try to evaluate them
-            evaluate_expression(&number_str)
-                .or_else(|| rust_decimal::Decimal::from_str_exact(&number_str).ok())?
-        } else {
-            rust_decimal::Decimal::from_str_exact(&number_str).ok()?
-        };
+        // A plain literal first, then arithmetic. The previous sniffing
+        // ("contains * or + or more than one -") misread `5-3` and `10/2` as
+        // literals, failed to parse them, and reported the posting as having
+        // no amount at all — which moves the balancing hint to the wrong
+        // posting and computes it without this posting's value.
+        let value = rust_decimal::Decimal::from_str_exact(&number_str)
+            .ok()
+            .or_else(|| evaluate_expression(&number_str))?;
         Some(Amount {
             value,
             currency: currency_str,
@@ -420,43 +414,117 @@ fn extract_compound_amount(
 }
 
 /// Simple expression evaluator for basic arithmetic
+/// Evaluate a beancount number expression: `+ - * /`, parentheses and unary
+/// signs, with checked arithmetic throughout.
+///
+/// The grammar allows arithmetic wherever a number is expected, so this has to
+/// handle precedence and chaining rather than one split — and it must bound
+/// its own recursion, since the expression comes straight from the buffer.
 fn evaluate_expression(expr: &str) -> Option<rust_decimal::Decimal> {
-    use rust_decimal::Decimal;
+    let bytes: Vec<u8> = expr
+        .bytes()
+        .filter(|b| !matches!(b, b' ' | b',' | b'\t'))
+        .collect();
+    let mut parser = ExprParser {
+        bytes: &bytes,
+        pos: 0,
+    };
+    let value = parser.expr(0)?;
+    // Trailing junk means this was not an expression after all.
+    if parser.pos != parser.bytes.len() {
+        return None;
+    }
+    Some(value)
+}
 
-    let expr = expr.trim();
+struct ExprParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
 
-    // Handle simple binary operations: a * b, a + b, a - b
-    if let Some(pos) = expr.rfind('*') {
-        let left = expr[..pos].trim();
-        let right = expr[pos + 1..].trim();
-        let left_val = Decimal::from_str_exact(left).ok()?;
-        let right_val = Decimal::from_str_exact(right).ok()?;
-        return left_val.checked_mul(right_val);
+/// Parenthesis nesting beyond this is not a real amount.
+const MAX_EXPR_DEPTH: usize = 64;
+
+impl ExprParser<'_> {
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
     }
 
-    if let Some(pos) = expr.rfind('+') {
-        let left = expr[..pos].trim();
-        let right = expr[pos + 1..].trim();
-        let left_val = Decimal::from_str_exact(left).ok()?;
-        let right_val = Decimal::from_str_exact(right).ok()?;
-        return left_val.checked_add(right_val);
+    /// Sums and differences, left-associative.
+    fn expr(&mut self, depth: usize) -> Option<rust_decimal::Decimal> {
+        if depth > MAX_EXPR_DEPTH {
+            return None;
+        }
+        let mut value = self.term(depth)?;
+        while let Some(op) = self.peek() {
+            if op != b'+' && op != b'-' {
+                break;
+            }
+            self.pos += 1;
+            let rhs = self.term(depth)?;
+            value = if op == b'+' {
+                value.checked_add(rhs)?
+            } else {
+                value.checked_sub(rhs)?
+            };
+        }
+        Some(value)
     }
 
-    // Handle subtraction (but not unary minus)
-    if let Some(pos) = expr.rfind('-')
-        && pos > 0
-    {
-        let left = expr[..pos].trim();
-        let right = expr[pos + 1..].trim();
-        if let (Ok(left_val), Ok(right_val)) = (
-            Decimal::from_str_exact(left),
-            Decimal::from_str_exact(right),
-        ) {
-            return left_val.checked_sub(right_val);
+    /// Products and quotients, left-associative.
+    fn term(&mut self, depth: usize) -> Option<rust_decimal::Decimal> {
+        let mut value = self.factor(depth)?;
+        while let Some(op) = self.peek() {
+            if op != b'*' && op != b'/' {
+                break;
+            }
+            self.pos += 1;
+            let rhs = self.factor(depth)?;
+            value = if op == b'*' {
+                value.checked_mul(rhs)?
+            } else {
+                // Division by zero yields None rather than panicking.
+                value.checked_div(rhs)?
+            };
+        }
+        Some(value)
+    }
+
+    /// Unary signs, parenthesised expressions and literals.
+    fn factor(&mut self, depth: usize) -> Option<rust_decimal::Decimal> {
+        match self.peek()? {
+            b'+' => {
+                self.pos += 1;
+                self.factor(depth)
+            }
+            b'-' => {
+                self.pos += 1;
+                Some(-self.factor(depth)?)
+            }
+            b'(' => {
+                self.pos += 1;
+                let value = self.expr(depth + 1)?;
+                if self.peek()? != b')' {
+                    return None;
+                }
+                self.pos += 1;
+                Some(value)
+            }
+            _ => self.number(),
         }
     }
 
-    None
+    fn number(&mut self) -> Option<rust_decimal::Decimal> {
+        let start = self.pos;
+        while matches!(self.peek(), Some(b) if b.is_ascii_digit() || b == b'.') {
+            self.pos += 1;
+        }
+        if self.pos == start {
+            return None;
+        }
+        let text = std::str::from_utf8(&self.bytes[start..self.pos]).ok()?;
+        rust_decimal::Decimal::from_str_exact(text).ok()
+    }
 }
 
 /// Calculate hint for balancing amounts (postings without explicit amounts)
@@ -664,6 +732,35 @@ fn calculate_total_hint(postings: &[Posting], position: Position) -> Option<Inla
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_evaluate_expression_precedence_and_chaining() {
+        use rust_decimal::Decimal;
+        let eval = |s: &str| evaluate_expression(s);
+        // The old splitter got all of these wrong (or refused them).
+        assert_eq!(eval("5-3"), Some(Decimal::from(2)));
+        assert_eq!(eval("10/2"), Some(Decimal::from(5)));
+        assert_eq!(eval("1+2*3"), Some(Decimal::from(7)));
+        assert_eq!(eval("1+2+3"), Some(Decimal::from(6)));
+        assert_eq!(eval("10-2-3"), Some(Decimal::from(5)));
+        assert_eq!(eval("(1+2)*3"), Some(Decimal::from(9)));
+        assert_eq!(eval("-4+10"), Some(Decimal::from(6)));
+        assert_eq!(
+            eval("1,000.50/2"),
+            Some(Decimal::from_str_exact("500.25").unwrap())
+        );
+        // Not expressions.
+        assert_eq!(eval("1+"), None);
+        assert_eq!(eval("(1+2"), None);
+        assert_eq!(eval("1/0"), None);
+        assert_eq!(eval("USD"), None);
+        assert_eq!(eval(""), None);
+        // Overflow is refused, not a panic.
+        assert_eq!(eval("79228162514264337593543950335*2"), None);
+        // Deep nesting is refused rather than overflowing the stack.
+        let deep = format!("{}1{}", "(".repeat(5_000), ")".repeat(5_000));
+        assert_eq!(eval(&deep), None);
+    }
+
     use super::*;
 
     #[test]
