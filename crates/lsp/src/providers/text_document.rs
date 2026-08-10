@@ -8,46 +8,30 @@ use crate::to_json;
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::Sender;
 use lsp_types::Notification;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tracing::{debug, warn};
 
-/// Process included files recursively from a given beancount file.
+/// Walk the include graph reachable from `from` on the thread pool.
 ///
-/// Uses `forest::parse_reachable_includes` (shared logic with the background
-/// forest initialiser) and `doc_store.insert_parsed` for consistent state updates.
-fn process_includes(
-    state: &mut LspServerState,
-    file_path: &PathBuf,
-    processed: &mut HashSet<PathBuf>,
-) -> Result<()> {
-    if processed.contains(file_path) {
-        return Ok(());
-    }
-    processed.insert(file_path.clone());
-
-    // Text only: include directives are scanned from the text, so this works
-    // before the document has been parsed.
-    let text = match state.doc_store.get_content(file_path) {
-        Some(text) => text,
-        None => return Ok(()),
-    };
-
-    // Pre-populate already_seen with files already in the forest to skip them.
-    let known: Vec<PathBuf> = state.doc_store.forest_keys().cloned().collect();
-    processed.extend(known);
-
-    forest::parse_reachable_includes(
-        file_path,
-        &text,
-        processed,
-        &mut |path, new_tree, content| {
-            state.doc_store.insert_parsed(path, new_tree, content);
-            Ok(())
-        },
-    )
+/// Reads and parses every not-yet-known file, streaming each one back to the
+/// main loop. Doing this inline in the notification handler meant opening a
+/// journal parsed the entire ledger before the editor got a response (measured
+/// at 450ms for a 7MB / 240-file ledger, and it scales with the ledger).
+///
+/// Files already in the forest are skipped, and an open buffer's own parse is
+/// never overwritten by the disk copy (see `handle_progress_task`).
+fn schedule_include_walk(state: &mut LspServerState, from: &PathBuf) {
+    let snapshot = state.snapshot();
+    let sender = state.task_sender.clone();
+    let from = from.clone();
+    state.thread_pool.execute(move || {
+        if let Err(e) = forest::parse_initial_forest(snapshot, from.clone(), sender) {
+            debug!("Include walk from {:?} failed: {}", from, e);
+        }
+    });
 }
 
 /// Provider function for `textDocument/didOpen`.
@@ -74,13 +58,10 @@ pub(crate) fn did_open(
         params.text_document.version,
     );
 
-    let mut processed = HashSet::new();
-    if let Err(e) = process_includes(state, &uri, &mut processed) {
-        debug!("Error processing includes for {:?}: {}", uri, e);
-    }
-    // Parse the buffer and extract semantics for it and any newly discovered
-    // includes — all on the pool.
+    // Everything heavy happens on the pool: the buffer's own parse, the
+    // include walk, and semantic extraction for whatever it turns up.
     state.schedule_parse(&uri);
+    schedule_include_walk(state, &uri);
     state.schedule_missing_extractions();
 
     let snapshot = state.snapshot();
@@ -105,10 +86,7 @@ pub(crate) fn did_open(
 /// at open: an `include` line added later was never picked up, and a removed
 /// one kept feeding completions and diagnostics forever.
 fn refresh_include_graph(state: &mut LspServerState, changed: &PathBuf) {
-    let mut processed = HashSet::new();
-    if let Err(e) = process_includes(state, changed, &mut processed) {
-        debug!("Error processing includes for {:?}: {}", changed, e);
-    }
+    schedule_include_walk(state, changed);
 
     let Some(root) = state.config.journal_root.clone() else {
         return;

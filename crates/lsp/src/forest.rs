@@ -26,7 +26,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::error;
-use tree_sitter_beancount::tree_sitter;
 
 #[derive(Debug, Clone)]
 struct FileCache {
@@ -145,42 +144,6 @@ pub(crate) fn extract_include_paths(text: &str, containing_file: &path::Path) ->
     discovered
 }
 
-/// Parse all files reachable via `include` directives starting from `tree`/`file`.
-///
-/// `text` must be the buffer for an open document rather than the file on
-/// disk: the two differ while there are unsaved changes.
-///
-/// Calls `on_parsed` for each newly discovered file. Pre-populate `already_seen`
-/// with paths to skip (e.g. already loaded in DocumentStore).
-pub(crate) fn parse_reachable_includes(
-    file: &path::Path,
-    text: &str,
-    already_seen: &mut HashSet<PathBuf>,
-    on_parsed: &mut impl FnMut(PathBuf, tree_sitter::Tree, &str) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    // Iterative: this runs in the did_open notification handler on the main
-    // loop, and a deep include chain must not overflow its stack.
-    let mut queue: Vec<PathBuf> = extract_include_paths(&text, file).into_iter().collect();
-    while let Some(path) = queue.pop() {
-        if already_seen.contains(&path) {
-            continue;
-        }
-        already_seen.insert(path.clone());
-        match fs::read_to_string(&path) {
-            Ok(content) => {
-                if let Some(new_tree) = crate::treesitter_utils::parse_beancount(&content) {
-                    on_parsed(path.clone(), new_tree.clone(), &content)?;
-                    queue.extend(extract_include_paths(&content, &path));
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to read include file {:?}: {}", path, e);
-            }
-        }
-    }
-    Ok(())
-}
-
 // Issus to look at if running into issues with this
 // https://github.com/silvanshade/lspower/issues/8
 pub(crate) fn parse_initial_forest(
@@ -295,6 +258,7 @@ pub(crate) fn parse_initial_forest(
 
 #[cfg(test)]
 mod tests {
+    use tree_sitter_beancount::tree_sitter;
     use super::*;
     use crate::config::Config;
     use std::fs;
