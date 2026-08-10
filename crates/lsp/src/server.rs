@@ -134,6 +134,10 @@ pub(crate) struct LspServerState {
     /// clear exactly those that no longer have any.
     pub published_diagnostics: std::collections::HashSet<PathBuf>,
 
+    /// Requests the client has cancelled. Shared with the thread pool so a
+    /// queued request can be dropped instead of computed.
+    pub cancelled: Arc<std::sync::Mutex<std::collections::HashSet<lsp_server::RequestId>>>,
+
     // Cached checker instance (created once and reused)
     pub checker_registry: CheckerRegistry,
 
@@ -204,6 +208,7 @@ impl LspServerState {
             extracting: std::collections::HashSet::new(),
             parsing: std::collections::HashSet::new(),
             published_diagnostics: std::collections::HashSet::new(),
+            cancelled: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             checker_registry: CheckerRegistry::new(),
             request_router,
         }
@@ -485,12 +490,32 @@ impl LspServerState {
             .on::<lsp_types::DidChangeWatchedFilesNotification>(
                 text_document::did_change_watched_files,
             )?
+            .on::<lsp_types::CancelNotification>(Self::cancel_request)?
             .finish();
+        Ok(())
+    }
+
+    /// Note a cancellation so a queued request can be skipped.
+    ///
+    /// The request still gets a response — the protocol requires one — but it
+    /// is an error rather than the result of work nobody is waiting for.
+    fn cancel_request(&mut self, params: lsp_types::CancelParams) -> Result<()> {
+        let id: lsp_server::RequestId = match params.id {
+            lsp_types::Id::Int(n) => n.into(),
+            lsp_types::Id::String(s) => s.into(),
+        };
+        tracing::debug!("cancelling request {id}");
+        if let Ok(mut cancelled) = self.cancelled.lock() {
+            cancelled.insert(id);
+        }
         Ok(())
     }
 
     // Sends a response to the client. This method logs the time it took us to reply to a request from the client.
     pub(crate) fn respond(&mut self, response: lsp_server::Response) {
+        if let Ok(mut cancelled) = self.cancelled.lock() {
+            cancelled.remove(&response.id);
+        }
         if let Some((method, start)) = self.req_queue.incoming.complete(&response.id) {
             let duration = start.elapsed();
             let is_error = response.error.is_some();

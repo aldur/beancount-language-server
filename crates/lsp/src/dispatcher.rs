@@ -101,7 +101,23 @@ impl RequestRouter {
                         let id = req.id;
                         let snapshot = state.snapshot();
                         let sender = state.task_sender.clone();
+                        let cancelled = state.cancelled.clone();
                         state.thread_pool.execute(move || {
+                            // Editors cancel eagerly — every keystroke
+                            // supersedes the previous completion — so a
+                            // request cancelled while queued should not be
+                            // computed at all.
+                            if cancelled.lock().is_ok_and(|set| set.contains(&id)) {
+                                let response = lsp_server::Response::new_err(
+                                    id,
+                                    lsp_server::ErrorCode::RequestCanceled as i32,
+                                    "request cancelled".to_string(),
+                                );
+                                if let Err(e) = sender.send(Task::Response(response)) {
+                                    tracing::error!("Failed to send response: {}", e);
+                                }
+                                return;
+                            }
                             let result = f(snapshot, params);
                             if let Err(e) =
                                 sender.send(Task::Response(result_to_response::<R>(id, result)))
