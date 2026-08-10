@@ -200,8 +200,10 @@ fn create_line_replacement_edit(
         return None;
     }
 
-    // Calculate character length (not byte length) for UTF-8 safety
-    let original_line_char_len = original_line.trim_end().chars().count();
+    // LSP range characters are UTF-16 code units — a char count falls short
+    // when the line holds astral-plane characters, and the client then leaves
+    // the tail of the old line in place.
+    let original_line_utf16_len = original_line.trim_end().encode_utf16().count();
 
     let line_start = lsp_types::Position {
         line: line_num as u32,
@@ -209,7 +211,7 @@ fn create_line_replacement_edit(
     };
     let line_end = lsp_types::Position {
         line: line_num as u32,
-        character: original_line_char_len as u32,
+        character: original_line_utf16_len as u32,
     };
 
     Some(lsp_types::TextEdit {
