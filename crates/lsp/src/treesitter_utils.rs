@@ -123,7 +123,10 @@ fn lsp_position_to_core(
     source: &ropey::Rope,
     position: lsp_types::Position,
 ) -> anyhow::Result<TextPosition> {
-    let row_idx = position.line as usize;
+    // Clamp the line like the UTF-16 column below: `line_to_char`/`line_to_byte`
+    // accept at most len_lines, and an out-of-bounds position from the client
+    // must degrade to the document end rather than panic.
+    let row_idx = (position.line as usize).min(source.len_lines());
 
     // LSP `character` is a *line-relative* UTF-16 code-unit offset.
     let col_utf16_cu_idx = position.character as usize;

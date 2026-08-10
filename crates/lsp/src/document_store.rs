@@ -104,9 +104,16 @@ impl DocumentStore {
         changes: &[lsp_types::TextDocumentContentChangeEvent],
         new_version: i32,
     ) -> Result<()> {
-        // Step 1 — calculate tree-sitter edit positions before mutating the rope.
-        let ts_edits = {
-            let doc = match self.open_docs.get(uri) {
+        // Steps 1+2 — convert each change to a tree-sitter edit and apply it to
+        // the rope, one change at a time. Each change's positions refer to the
+        // document as left by the *previous* change (LSP sync semantics), so
+        // converting the whole batch up front against the pre-edit rope reads
+        // lines that do not exist yet: the edits desync the tree, and a change
+        // that lands on a line created earlier in the batch is out of bounds
+        // for the old rope and panics.
+        let mut ts_edits = Vec::with_capacity(changes.len());
+        {
+            let doc = match Arc::make_mut(&mut self.open_docs).get_mut(uri) {
                 Some(d) => d,
                 None => {
                     tracing::warn!("Document not found in open_docs: {:?}", uri);
@@ -124,20 +131,8 @@ impl DocumentStore {
             }
             tracing::trace!("Document version: {} -> {}", current_version, new_version);
 
-            changes
-                .iter()
-                .map(|change| lsp_textdocchange_to_ts_inputedit(&doc.content, change))
-                .collect::<Result<Vec<_>, _>>()?
-            // doc borrow released
-        };
-
-        // Step 2 — apply rope edits and update the version.
-        {
-            let doc = Arc::make_mut(&mut self.open_docs)
-                .get_mut(uri)
-                .expect("doc should exist after prior check");
-
             for change in changes {
+                ts_edits.push(lsp_textdocchange_to_ts_inputedit(&doc.content, change)?);
                 let (text, range) = match change {
                     lsp_types::TextDocumentContentChangeEvent::TextDocumentContentChangePartial(c) => {
                         (c.text.as_str(), c.range)
@@ -158,8 +153,15 @@ impl DocumentStore {
                     }
                 };
 
-                let start_row_char_idx = doc.content.line_to_char(range.start.line as usize);
-                let end_row_char_idx = doc.content.line_to_char(range.end.line as usize);
+                // Clamp line indices like the UTF-16 columns below: a position
+                // beyond the document must degrade to the document end, not
+                // panic the main loop (`line_to_char` accepts at most len_lines).
+                let start_row_char_idx = doc
+                    .content
+                    .line_to_char((range.start.line as usize).min(doc.content.len_lines()));
+                let end_row_char_idx = doc
+                    .content
+                    .line_to_char((range.end.line as usize).min(doc.content.len_lines()));
 
                 let start_line_utf16_cu = doc.content.char_to_utf16_cu(start_row_char_idx);
                 let start_utf16_idx = (start_line_utf16_cu + range.start.character as usize)
@@ -439,6 +441,63 @@ mod tests {
         let doc = store.open_docs.get(&uri).unwrap();
         assert_eq!(doc.text_string(), "world");
         assert_eq!(doc.version, 2);
+    }
+
+    #[allow(deprecated)]
+    fn partial(
+        start: (u32, u32),
+        end: (u32, u32),
+        text: &str,
+    ) -> lsp_types::TextDocumentContentChangeEvent {
+        lsp_types::TextDocumentContentChangeEvent::TextDocumentContentChangePartial(
+            lsp_types::TextDocumentContentChangePartial {
+                range: lsp_types::Range {
+                    start: lsp_types::Position::new(start.0, start.1),
+                    end: lsp_types::Position::new(end.0, end.1),
+                },
+                range_length: None,
+                text: text.to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn test_apply_change_batch_applies_sequentially() {
+        // A didChange batch applies sequentially: a later change may reference
+        // lines created by an earlier one in the same batch. Converting the
+        // whole batch against the pre-edit rope panicked (line out of bounds)
+        // and desynced the tree-sitter edits.
+        let mut store = DocumentStore::new();
+        let uri = PathBuf::from("/test/file.beancount");
+        store.open(uri.clone(), "2024-01-01 open Assets:Cash\n", 1);
+
+        let changes = vec![
+            partial((1, 0), (1, 0), "line1\nline2\nline3\n"),
+            // line 3 does not exist in the pre-batch document
+            partial((3, 0), (3, 5), "edited"),
+        ];
+        store.apply_change(&uri, &changes, 2).unwrap();
+
+        let doc = store.open_docs.get(&uri).unwrap();
+        assert_eq!(
+            doc.text_string(),
+            "2024-01-01 open Assets:Cash\nline1\nline2\nedited\n"
+        );
+    }
+
+    #[test]
+    fn test_apply_change_out_of_bounds_line_is_clamped() {
+        // A position beyond the last line degrades to the document end
+        // instead of panicking the main loop.
+        let mut store = DocumentStore::new();
+        let uri = PathBuf::from("/test/file.beancount");
+        store.open(uri.clone(), "2024-01-01 open Assets:Cash\n", 1);
+
+        let changes = vec![partial((99, 7), (99, 9), "; tail")];
+        store.apply_change(&uri, &changes, 2).unwrap();
+
+        let doc = store.open_docs.get(&uri).unwrap();
+        assert_eq!(doc.text_string(), "2024-01-01 open Assets:Cash\n; tail");
     }
 
     #[test]
