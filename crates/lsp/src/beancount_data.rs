@@ -89,7 +89,13 @@ impl BeancountData {
         tracing::debug!("beancount_data:: executing unified query");
         let unified_query = query_cache::unified_query();
         let mut cursor_qry = tree_sitter::QueryCursor::new();
-        let mut matches = cursor_qry.matches(unified_query, tree.root_node(), content_bytes);
+        let mut progress = crate::query_utils::query_deadline();
+        let mut matches = cursor_qry.matches_with_options(
+            unified_query,
+            tree.root_node(),
+            content_bytes,
+            tree_sitter::QueryCursorOptions::new().progress_callback(&mut progress),
+        );
 
         // Get capture indices for efficient dispatch
         let tag_idx = unified_query
@@ -212,7 +218,13 @@ impl BeancountData {
         tracing::debug!("beancount_data:: get commodities");
         let currency_query = query_cache::currency_query();
         let mut cursor_qry = tree_sitter::QueryCursor::new();
-        let mut matches = cursor_qry.matches(currency_query, tree.root_node(), content_bytes);
+        let mut progress = crate::query_utils::query_deadline();
+        let mut matches = cursor_qry.matches_with_options(
+            currency_query,
+            tree.root_node(),
+            content_bytes,
+            tree_sitter::QueryCursorOptions::new().progress_callback(&mut progress),
+        );
 
         let mut commodities_count: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
@@ -238,7 +250,13 @@ impl BeancountData {
         tracing::debug!("beancount_data:: get account notes");
         let note_query = query_cache::note_query();
         let mut cursor_qry = tree_sitter::QueryCursor::new();
-        let mut matches = cursor_qry.matches(note_query, tree.root_node(), content_bytes);
+        let mut progress = crate::query_utils::query_deadline();
+        let mut matches = cursor_qry.matches_with_options(
+            note_query,
+            tree.root_node(),
+            content_bytes,
+            tree_sitter::QueryCursorOptions::new().progress_callback(&mut progress),
+        );
 
         let account_idx = note_query
             .capture_index_for_name("account")
@@ -271,7 +289,13 @@ impl BeancountData {
         tracing::debug!("beancount_data:: get option directives");
         let option_query = query_cache::option_query();
         let mut cursor_qry = tree_sitter::QueryCursor::new();
-        let mut matches = cursor_qry.matches(option_query, tree.root_node(), content_bytes);
+        let mut progress = crate::query_utils::query_deadline();
+        let mut matches = cursor_qry.matches_with_options(
+            option_query,
+            tree.root_node(),
+            content_bytes,
+            tree_sitter::QueryCursorOptions::new().progress_callback(&mut progress),
+        );
 
         let key_idx = option_query
             .capture_index_for_name("key")

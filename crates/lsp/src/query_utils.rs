@@ -329,3 +329,33 @@ mod tests {
         assert_eq!(currencies[1], "EUR");
     }
 }
+
+/// Wall-clock budget for a single tree-sitter query pass.
+///
+/// Query execution is superlinear on some pathological trees (a document with
+/// tens of thousands of parentheses on one line took minutes), and semantic
+/// extraction runs on the main loop — so an unbounded query freezes the whole
+/// server, not just one request. Exceeding the budget yields partial results,
+/// which degrade a few completions rather than the entire session.
+pub(crate) const QUERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A deadline-carrying progress callback for `matches_with_options`.
+///
+/// Returns a closure to pass to [`tree_sitter::QueryCursorOptions::progress_callback`];
+/// keep it alive for the duration of the iteration.
+pub(crate) fn query_deadline()
+-> impl FnMut(&tree_sitter::QueryCursorState) -> std::ops::ControlFlow<()> {
+    let deadline = std::time::Instant::now() + QUERY_BUDGET;
+    let mut warned = false;
+    move |_state| {
+        if std::time::Instant::now() >= deadline {
+            if !warned {
+                warned = true;
+                tracing::warn!("query exceeded {QUERY_BUDGET:?}, returning partial results");
+            }
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+}
