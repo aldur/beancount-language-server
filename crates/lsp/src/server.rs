@@ -390,12 +390,11 @@ impl LspServerState {
 
     // Handles a response to a request we made. The response gets forwarded to where we made the request from.
     fn complete_request(&mut self, resp: lsp_server::Response) {
-        let handler = self
-            .req_queue
-            .outgoing
-            .complete(resp.id.clone())
-            .expect("received response for unknown request");
-        handler(self, resp)
+        // A duplicate or spurious response id must not panic the main loop.
+        match self.req_queue.outgoing.complete(resp.id.clone()) {
+            Some(handler) => handler(self, resp),
+            None => tracing::error!("received response for unknown request: {:?}", resp.id),
+        }
     }
 
     // Handles a notification from the language server client
