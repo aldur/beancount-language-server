@@ -6,7 +6,6 @@ use crate::treesitter_utils::{
     lsp_position_to_tree_sitter_point_range, text_for_tree_sitter_node,
     tree_sitter_node_to_lsp_range,
 };
-use anyhow::Context;
 use anyhow::Result;
 use lsp_types::DefinitionResponse;
 use lsp_types::Location;
@@ -27,9 +26,12 @@ pub(crate) fn definition(
     let doc_uri = &params.text_document_position_params.text_document.uri;
     let position = params.text_document_position_params.position;
 
-    let (tree, doc) = snapshot
-        .tree_and_document_for_uri(doc_uri)
-        .context("Failed to get tree/document for definition")?;
+    // A missing tree means the document is not parsed (yet): decline rather
+    // than answering with a protocol error.
+    let Ok((tree, doc)) = snapshot.tree_and_document_for_uri(doc_uri) else {
+        tracing::debug!("Definition: no tree/document for {}", doc_uri.as_str());
+        return Ok(None);
+    };
     let content = doc.content.clone();
 
     let (start, end) = lsp_position_to_tree_sitter_point_range(&content, position)?;

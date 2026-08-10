@@ -27,7 +27,11 @@ pub(crate) fn completion(
     );
 
     // Get parsed tree and document (snapshot helper supports Uri directly)
-    let (tree, doc) = snapshot.tree_and_document_for_uri(&cursor.text_document.uri)?;
+    // Not parsed (yet): no completions, not a protocol error.
+    let Ok((tree, doc)) = snapshot.tree_and_document_for_uri(&cursor.text_document.uri) else {
+        debug!("Completion: no tree/document for {}", cursor.text_document.uri.as_str());
+        return Ok(None);
+    };
 
     let content = &doc.content;
 

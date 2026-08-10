@@ -11,7 +11,6 @@ use lsp_types::Notification;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::str::FromStr;
 use tracing::{debug, warn};
 

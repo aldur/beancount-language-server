@@ -5,7 +5,7 @@
 /// 2. Transaction totals - displays total when transaction doesn't balance
 use crate::server::LspServerStateSnapshot;
 use crate::treesitter_utils::text_for_tree_sitter_node;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use lsp_types::{InlayHint, InlayHintKind, InlayHintParams, Label, Position};
 use std::collections::HashMap;
 use tree_sitter::StreamingIterator;
@@ -87,9 +87,11 @@ pub(crate) fn inlay_hints(
 ) -> Result<Option<Vec<InlayHint>>> {
     let uri = &params.text_document.uri;
 
-    let (tree, doc) = snapshot
-        .tree_and_document_for_uri(uri)
-        .context("Failed to get tree/document for inlay hints")?;
+    // Not parsed (yet): an empty hint list, not a protocol error.
+    let Ok((tree, doc)) = snapshot.tree_and_document_for_uri(uri) else {
+        tracing::debug!("Inlay hints: no tree/document for {}", uri.as_str());
+        return Ok(None);
+    };
     let content = &doc.content;
     let content_str = content.to_string();
     let content_bytes = content_str.as_bytes();
