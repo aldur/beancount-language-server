@@ -114,8 +114,8 @@ fn extract_transaction_symbol(node: &Node, content: &Rope) -> Option<DocumentSym
         name,
         detail: Some("Transaction".to_string()),
         kind: SymbolKind::Struct,
-        range: node_to_range(node),
-        selection_range: node_to_range(node),
+        range: node_to_range(content, node),
+        selection_range: node_to_range(content, node),
         children: if postings.is_empty() {
             None
         } else {
@@ -156,8 +156,8 @@ fn extract_posting_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol>
         name,
         detail: Some("Posting".to_string()),
         kind: SymbolKind::Property,
-        range: node_to_range(node),
-        selection_range: node_to_range(node),
+        range: node_to_range(content, node),
+        selection_range: node_to_range(content, node),
         children: None,
         #[allow(deprecated)]
         deprecated: None,
@@ -193,8 +193,8 @@ fn extract_open_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
         name: account,
         detail: Some(detail),
         kind: SymbolKind::File,
-        range: node_to_range(node),
-        selection_range: node_to_range(node),
+        range: node_to_range(content, node),
+        selection_range: node_to_range(content, node),
         children: None,
         #[allow(deprecated)]
         deprecated: None,
@@ -218,8 +218,8 @@ fn extract_close_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
         name: account,
         detail: Some("Close".to_string()),
         kind: SymbolKind::File,
-        range: node_to_range(node),
-        selection_range: node_to_range(node),
+        range: node_to_range(content, node),
+        selection_range: node_to_range(content, node),
         children: None,
         #[allow(deprecated)]
         deprecated: None,
@@ -255,8 +255,8 @@ fn extract_balance_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol>
         name,
         detail: Some("Balance".to_string()),
         kind: SymbolKind::Constant,
-        range: node_to_range(node),
-        selection_range: node_to_range(node),
+        range: node_to_range(content, node),
+        selection_range: node_to_range(content, node),
         children: None,
         #[allow(deprecated)]
         deprecated: None,
@@ -292,8 +292,8 @@ fn extract_price_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
         name,
         detail: Some("Price".to_string()),
         kind: SymbolKind::Number,
-        range: node_to_range(node),
-        selection_range: node_to_range(node),
+        range: node_to_range(content, node),
+        selection_range: node_to_range(content, node),
         children: None,
         #[allow(deprecated)]
         deprecated: None,
@@ -317,8 +317,8 @@ fn extract_commodity_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbo
         name: currency,
         detail: Some("Commodity".to_string()),
         kind: SymbolKind::Class,
-        range: node_to_range(node),
-        selection_range: node_to_range(node),
+        range: node_to_range(content, node),
+        selection_range: node_to_range(content, node),
         children: None,
         #[allow(deprecated)]
         deprecated: None,
@@ -355,8 +355,8 @@ fn extract_event_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
         name,
         detail: Some("Event".to_string()),
         kind: SymbolKind::Event,
-        range: node_to_range(node),
-        selection_range: node_to_range(node),
+        range: node_to_range(content, node),
+        selection_range: node_to_range(content, node),
         children: None,
         #[allow(deprecated)]
         deprecated: None,
@@ -386,8 +386,8 @@ fn extract_option_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> 
         name,
         detail: Some("Option".to_string()),
         kind: SymbolKind::Property,
-        range: node_to_range(node),
-        selection_range: node_to_range(node),
+        range: node_to_range(content, node),
+        selection_range: node_to_range(content, node),
         children: None,
         #[allow(deprecated)]
         deprecated: None,
@@ -452,8 +452,8 @@ fn extract_section_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol>
         name: headline_text,
         detail: Some(detail),
         kind: SymbolKind::Namespace,
-        range: node_to_range(node),
-        selection_range: node_to_range(node),
+        range: node_to_range(content, node),
+        selection_range: node_to_range(content, node),
         children: if children.is_empty() {
             None
         } else {
@@ -493,8 +493,8 @@ fn extract_heading_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol>
             name: heading_text.to_string(),
             detail: Some(detail),
             kind: SymbolKind::Namespace,
-            range: node_to_range(node),
-            selection_range: node_to_range(node),
+            range: node_to_range(content, node),
+            selection_range: node_to_range(content, node),
             children: None,
             #[allow(deprecated)]
             deprecated: None,
@@ -507,17 +507,11 @@ fn extract_heading_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol>
 }
 
 /// Convert a tree-sitter node to an LSP Range.
-fn node_to_range(node: &Node) -> lsp_types::Range {
-    lsp_types::Range {
-        start: lsp_types::Position {
-            line: node.start_position().row as u32,
-            character: node.start_position().column as u32,
-        },
-        end: lsp_types::Position {
-            line: node.end_position().row as u32,
-            character: node.end_position().column as u32,
-        },
-    }
+///
+/// Point.column is a byte offset; LSP characters are UTF-16 code units, so
+/// the conversion must go through the rope.
+fn node_to_range(content: &Rope, node: &Node) -> lsp_types::Range {
+    crate::treesitter_utils::tree_sitter_node_to_lsp_range(content, node)
 }
 
 #[cfg(test)]

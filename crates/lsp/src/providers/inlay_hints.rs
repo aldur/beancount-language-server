@@ -160,12 +160,12 @@ fn process_transaction(
 
     if has_missing_amount {
         // If there's a missing amount, show the balancing amount at the end of that posting line
-        if let Some(hint) = calculate_balancing_hint(&postings) {
+        if let Some(hint) = calculate_balancing_hint(&postings, content) {
             hints.push(hint);
         }
     } else {
         // If all postings have amounts, only show hint if transaction doesn't balance
-        let txn_line_end_pos = get_transaction_line_end_position(txn_node);
+        let txn_line_end_pos = get_transaction_line_end_position(txn_node, content);
         if let Some(hint) = calculate_total_hint(&postings, txn_line_end_pos) {
             hints.push(hint);
         }
@@ -175,23 +175,26 @@ fn process_transaction(
 }
 
 /// Get the position at the end of the transaction's first line
-fn get_transaction_line_end_position(txn_node: &tree_sitter::Node) -> Position {
+fn get_transaction_line_end_position(
+    txn_node: &tree_sitter::Node,
+    content: &ropey::Rope,
+) -> Position {
     // Find the end of the first line of the transaction (after narration/payee)
     let mut cursor = txn_node.walk();
-    let mut last_col = txn_node.start_position().column;
+    let mut last_end_byte = txn_node.start_byte();
     let txn_row = txn_node.start_position().row;
 
     for child in txn_node.children(&mut cursor) {
         // Only look at children on the first line of the transaction
         if child.start_position().row == txn_row {
-            last_col = child.end_position().column;
+            last_end_byte = child.end_byte();
         } else {
             // Once we hit a child on a different line, stop
             break;
         }
     }
 
-    Position::new(txn_row as u32, last_col as u32)
+    crate::treesitter_utils::byte_to_lsp_position(content, last_end_byte)
 }
 
 /// Extract all postings from a transaction
@@ -449,7 +452,7 @@ fn evaluate_expression(expr: &str) -> Option<rust_decimal::Decimal> {
 }
 
 /// Calculate hint for balancing amounts (postings without explicit amounts)
-fn calculate_balancing_hint(postings: &[Posting]) -> Option<InlayHint> {
+fn calculate_balancing_hint(postings: &[Posting], content: &ropey::Rope) -> Option<InlayHint> {
     // Find posting without amount
     let posting_without_amount = postings.iter().find(|p| p.amount.is_none())?;
 
@@ -523,10 +526,21 @@ fn calculate_balancing_hint(postings: &[Posting]) -> Option<InlayHint> {
         format!("{:width$}{}", "", amounts.join(", "), width = spaces_needed)
     };
 
-    // Position at the end of the account name
+    // Position at the end of the account name. Point columns are byte
+    // offsets, so the emitted LSP position must go through the rope.
+    let account_end_byte = {
+        let mut cursor = posting_without_amount.node.walk();
+        posting_without_amount
+            .node
+            .children(&mut cursor)
+            .find(|c| c.kind() == "account")
+            .map(|c| c.end_byte())
+    };
     let range = posting_without_amount.node.range();
-    // Use start_point.row to ensure we're on the posting line itself
-    let position = Position::new(range.start_point.row as u32, account_end_column as u32);
+    let position = match account_end_byte {
+        Some(byte) => crate::treesitter_utils::byte_to_lsp_position(content, byte),
+        None => Position::new(range.start_point.row as u32, range.start_point.column as u32),
+    };
 
     Some(InlayHint {
         position,

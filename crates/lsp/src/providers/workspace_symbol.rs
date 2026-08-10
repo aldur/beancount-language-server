@@ -147,7 +147,7 @@ fn extract_account_symbol(
             deprecated: None,
             location: Location {
                 uri: uri.clone(),
-                range: node_to_range(node),
+                range: node_to_range(content, node),
             },
         })
     } else {
@@ -210,7 +210,7 @@ fn extract_transaction_symbol(
             },
             location: Location {
                 uri: uri.clone(),
-                range: node_to_range(node),
+                range: node_to_range(content, node),
             },
             deprecated: None,
         })
@@ -268,7 +268,7 @@ fn extract_tags_and_links_query(
                         deprecated: None,
                         location: Location {
                             uri: uri.clone(),
-                            range: node_to_range(&capture.node),
+                            range: node_to_range(content, &capture.node),
                         },
                     });
                 }
@@ -286,7 +286,7 @@ fn extract_tags_and_links_query(
                         deprecated: None,
                         location: Location {
                             uri: uri.clone(),
-                            range: node_to_range(&capture.node),
+                            range: node_to_range(content, &capture.node),
                         },
                     });
                 }
@@ -323,7 +323,7 @@ fn extract_commodity_symbol(
             },
             location: Location {
                 uri: uri.clone(),
-                range: node_to_range(node),
+                range: node_to_range(content, node),
             },
             deprecated: None,
         })
@@ -372,7 +372,7 @@ fn extract_price_symbol(
             },
             location: Location {
                 uri: uri.clone(),
-                range: node_to_range(node),
+                range: node_to_range(content, node),
             },
             deprecated: None,
         })
@@ -382,17 +382,11 @@ fn extract_price_symbol(
 }
 
 /// Convert a tree-sitter node to an LSP Range.
-fn node_to_range(node: &Node) -> lsp_types::Range {
-    lsp_types::Range {
-        start: lsp_types::Position {
-            line: node.start_position().row as u32,
-            character: node.start_position().column as u32,
-        },
-        end: lsp_types::Position {
-            line: node.end_position().row as u32,
-            character: node.end_position().column as u32,
-        },
-    }
+///
+/// Point.column is a byte offset; LSP characters are UTF-16 code units, so
+/// the conversion must go through the rope.
+fn node_to_range(content: &Rope, node: &Node) -> lsp_types::Range {
+    crate::treesitter_utils::tree_sitter_node_to_lsp_range(content, node)
 }
 
 #[cfg(test)]
