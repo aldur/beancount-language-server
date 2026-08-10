@@ -798,3 +798,64 @@ option "name_expenses" "Aufwendungen"
         );
     }
 }
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::time::Instant;
+
+    /// Timing harness: `BENCH_FILE=/path cargo test --lib bench_stages -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_stages() {
+        let path = std::env::var("BENCH_FILE").expect("set BENCH_FILE");
+        let text = std::fs::read_to_string(&path).unwrap();
+        eprintln!("file: {} bytes", text.len());
+
+        let t = Instant::now();
+        let tree = crate::treesitter_utils::parse_beancount(&text).expect("parse");
+        eprintln!("parse:            {:?}", t.elapsed());
+
+        let t = Instant::now();
+        let deep = crate::treesitter_utils::tree_depth_exceeds(
+            &tree,
+            crate::treesitter_utils::MAX_TREE_DEPTH,
+        );
+        eprintln!("depth check:      {:?} (exceeds={deep})", t.elapsed());
+
+        let t = Instant::now();
+        let rope = ropey::Rope::from_str(&text);
+        eprintln!("rope build:       {:?}", t.elapsed());
+
+        let t = Instant::now();
+        let _s = rope.to_string();
+        eprintln!("rope to_string:   {:?}", t.elapsed());
+
+        let t = Instant::now();
+        let data = BeancountData::new(&Arc::new(tree.clone()), &rope);
+        eprintln!(
+            "BeancountData:    {:?} ({} accounts)",
+            t.elapsed(),
+            data.get_accounts().len()
+        );
+
+        let t = Instant::now();
+        let mut count = 0usize;
+        let mut cursor = tree.walk();
+        loop {
+            count += 1;
+            if cursor.goto_first_child() {
+                continue;
+            }
+            loop {
+                if cursor.goto_next_sibling() {
+                    break;
+                }
+                if !cursor.goto_parent() {
+                    eprintln!("node count:       {count} in {:?}", t.elapsed());
+                    return;
+                }
+            }
+        }
+    }
+}

@@ -531,6 +531,13 @@ impl LspServerState {
 
     /// Rebuild a file's semantic data on the thread pool, at most one at a
     /// time per file.
+    /// Schedule rebuilds for every forest file that has no semantic data yet.
+    pub(crate) fn schedule_missing_extractions(&mut self) {
+        for path in self.doc_store.files_missing_data() {
+            self.schedule_extraction(&path);
+        }
+    }
+
     pub(crate) fn schedule_extraction(&mut self, uri: &PathBuf) {
         if self.extracting.contains(uri) {
             return;
@@ -554,10 +561,9 @@ impl LspServerState {
     }
 
     pub(crate) fn snapshot(&mut self) -> LspServerStateSnapshot {
-        let uris: Vec<PathBuf> = self.doc_store.open_doc_keys().cloned().collect();
-        for uri in uris {
-            self.doc_store.ensure_beancount_data(&uri);
-        }
+        // Deliberately no extraction here: this runs on the main loop for
+        // every request, and rebuilding semantic data is unbounded work.
+        // Whoever changes a document schedules the rebuild instead.
         let DocumentStoreMaps {
             open_docs,
             forest,

@@ -10,6 +10,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tree_sitter_beancount::tree_sitter;
 
+/// Version stand-in for files that are in the forest but not open in the
+/// editor, and therefore have no document version.
+pub(crate) const NO_VERSION: i32 = i32::MIN;
+
 /// Arc-wrapped views of the public maps, used to construct `LspServerStateSnapshot`.
 ///
 /// Each field is an `Arc<HashMap<…>>` so that taking a snapshot is a cheap pointer
@@ -101,15 +105,11 @@ impl DocumentStore {
         };
         let tree = Arc::new(tree);
 
-        let doc_content = &self
-            .open_docs
-            .get(&uri)
-            .expect("doc should exist after insertion")
-            .content;
-        let beancount_data = BeancountData::new(&tree, doc_content);
-
         Arc::make_mut(&mut self.forest).insert(uri.clone(), tree);
-        Arc::make_mut(&mut self.beancount_data).insert(uri.clone(), Arc::new(beancount_data));
+        // Semantic extraction is scheduled by the caller, never done here:
+        // it is unbounded work (measured at 8s for a 100kB pathological file)
+        // and this runs in the didOpen handler on the main loop.
+        Arc::make_mut(&mut self.beancount_data).remove(&uri);
         // open_docs is now the source of truth for this file's content
         Arc::make_mut(&mut self.forest_content).remove(&uri);
     }
@@ -331,9 +331,9 @@ impl DocumentStore {
     pub(crate) fn insert_parsed(&mut self, uri: PathBuf, tree: tree_sitter::Tree, content: &str) {
         let tree_arc = Arc::new(tree);
         let rope = Rope::from_str(content);
-        let beancount_data = BeancountData::new(&tree_arc, &rope);
         Arc::make_mut(&mut self.forest).insert(uri.clone(), tree_arc);
-        Arc::make_mut(&mut self.beancount_data).insert(uri.clone(), Arc::new(beancount_data));
+        // Extraction is the caller's job, off the main loop (see `open`).
+        Arc::make_mut(&mut self.beancount_data).remove(&uri);
         Arc::make_mut(&mut self.forest_content).insert(uri, Arc::new(rope));
     }
 
@@ -379,13 +379,13 @@ impl DocumentStore {
         keep.insert(root.to_path_buf());
         let mut queue: Vec<PathBuf> = keep.iter().cloned().collect();
         while let Some(path) = queue.pop() {
-            let Some(tree) = self.forest.get(&path) else {
+            if !self.forest.contains_key(&path) {
                 continue;
-            };
+            }
             let Some(text) = self.get_content(&path) else {
                 continue;
             };
-            for include in crate::forest::extract_include_paths(tree, text.as_bytes(), &path) {
+            for include in crate::forest::extract_include_paths(&text, &path) {
                 if keep.insert(include.clone()) {
                     queue.push(include);
                 }
@@ -413,8 +413,21 @@ impl DocumentStore {
         uri: &PathBuf,
     ) -> Option<(Arc<tree_sitter::Tree>, Arc<Rope>, i32)> {
         let tree = self.forest.get(uri)?.clone();
-        let doc = self.open_docs.get(uri)?;
-        Some((tree, Arc::new(doc.content.clone()), doc.version))
+        match self.open_docs.get(uri) {
+            Some(doc) => Some((tree, Arc::new(doc.content.clone()), doc.version)),
+            // Not open: the cached rope is the source of truth and carries no
+            // version, so `install_beancount_data` accepts it unconditionally.
+            None => Some((tree, self.forest_content.get(uri)?.clone(), NO_VERSION)),
+        }
+    }
+
+    /// Files that are in the forest but have no semantic data yet.
+    pub(crate) fn files_missing_data(&self) -> Vec<PathBuf> {
+        self.forest
+            .keys()
+            .filter(|path| !self.beancount_data.contains_key(*path))
+            .cloned()
+            .collect()
     }
 
     /// Install semantic data computed off-thread, unless the document moved on.
@@ -424,6 +437,14 @@ impl DocumentStore {
         data: Arc<BeancountData>,
         version: i32,
     ) {
+        // Not-open files have no version to compare; accept while they are
+        // still part of the forest.
+        if version == NO_VERSION {
+            if self.forest.contains_key(uri) {
+                Arc::make_mut(&mut self.beancount_data).insert(uri.clone(), data);
+            }
+            return;
+        }
         match self.open_docs.get(uri) {
             Some(doc) if doc.version == version => {
                 Arc::make_mut(&mut self.beancount_data).insert(uri.clone(), data);
@@ -528,8 +549,12 @@ mod tests {
 
         assert!(store.open_docs.contains_key(&uri));
         assert!(store.get_tree(&uri).is_some());
-        assert!(store.beancount_data.contains_key(&uri));
         assert_eq!(store.open_docs.get(&uri).unwrap().version, 1);
+        // Semantic data is built off the main loop, so it is absent until the
+        // scheduled extraction lands.
+        assert!(!store.beancount_data.contains_key(&uri));
+        store.ensure_beancount_data(&uri);
+        assert!(store.beancount_data.contains_key(&uri));
     }
 
     #[test]
@@ -537,6 +562,7 @@ mod tests {
         let mut store = DocumentStore::new();
         let uri = PathBuf::from("/test/file.beancount");
         store.open(uri.clone(), CONTENT, 1);
+        store.ensure_beancount_data(&uri);
 
         #[allow(deprecated)]
         let change = lsp_types::TextDocumentContentChangeEvent::TextDocumentContentChangePartial(
@@ -760,9 +786,16 @@ mod tests {
 
         // Older version than the document: dropped.
         store.open(uri.clone(), CONTENT, 5);
-        let current = store.beancount_data.get(&uri).unwrap().clone();
         store.install_beancount_data(&uri, fresh.clone(), 1);
-        assert!(Arc::ptr_eq(store.beancount_data.get(&uri).unwrap(), &current));
+        assert!(!store.beancount_data.contains_key(&uri));
+
+        // A forest file that is not open carries no version and is accepted.
+        let other = PathBuf::from("/test/included.beancount");
+        store.insert_parsed(other.clone(), parse(CONTENT), CONTENT);
+        let (tree, rope, version) = store.extraction_inputs(&other).unwrap();
+        assert_eq!(version, NO_VERSION);
+        store.install_beancount_data(&other, Arc::new(BeancountData::new(&tree, &rope)), version);
+        assert!(store.beancount_data.contains_key(&other));
     }
 
     #[test]
@@ -770,6 +803,7 @@ mod tests {
         let mut store = DocumentStore::new();
         let uri = PathBuf::from("/test/file.beancount");
         store.open(uri.clone(), CONTENT, 1);
+        store.ensure_beancount_data(&uri);
 
         let first_ptr = Arc::as_ptr(store.beancount_data.get(&uri).unwrap());
         store.ensure_beancount_data(&uri);
@@ -807,10 +841,11 @@ mod tests {
         store.insert_parsed(uri.clone(), tree, CONTENT);
 
         assert!(store.get_tree(&uri).is_some());
-        assert!(store.beancount_data.contains_key(&uri));
         assert!(store.forest_content.contains_key(&uri));
         // not an open doc
         assert!(store.open_docs.get(&uri).is_none());
+        // Semantic data is scheduled by the caller, not built here.
+        assert!(!store.beancount_data.contains_key(&uri));
     }
 
     #[test]
@@ -905,6 +940,7 @@ mod tests {
         let uri = PathBuf::from("/test/file.beancount");
         store.open(uri.clone(), CONTENT, 1);
 
+        store.ensure_beancount_data(&uri);
         let maps = store.snapshot_maps();
 
         assert!(maps.open_docs.contains_key(&uri));

@@ -84,6 +84,9 @@ pub(crate) fn did_open(
     if let Err(e) = process_includes(state, &uri, &mut processed) {
         debug!("Error processing includes for {:?}: {}", uri, e);
     }
+    // The opened buffer and any newly discovered includes have trees but no
+    // semantic data yet; build it on the pool.
+    state.schedule_missing_extractions();
 
     let snapshot = state.snapshot();
     let task_sender = state.task_sender.clone();
@@ -234,6 +237,7 @@ pub(crate) fn did_change_watched_files(
                     state.doc_store.insert_parsed(uri.clone(), tree, &content);
                     tracing::debug!("Re-parsed external file: {:?}", uri);
                     refresh_include_graph(state, &uri);
+                    state.schedule_missing_extractions();
                 }
             }
             lsp_types::FileChangeType::Deleted => {
@@ -744,10 +748,10 @@ mod tests {
         use crate::server::LspServerStateSnapshot;
         use crossbeam_channel;
         use std::collections::HashMap;
+        use std::sync::Arc;
         use std::path::PathBuf;
         use std::str::FromStr;
-        use std::sync::Arc;
-
+        
         // Create a temporary test file
         let temp_dir = tempfile::tempdir().unwrap();
         let test_file = temp_dir.path().join("test.beancount");
@@ -815,10 +819,10 @@ mod tests {
         use crate::server::LspServerStateSnapshot;
         use crossbeam_channel;
         use std::collections::HashMap;
+        use std::sync::Arc;
         use std::path::PathBuf;
         use std::str::FromStr;
-        use std::sync::Arc;
-
+        
         // Create temporary test files
         let temp_dir = tempfile::tempdir().unwrap();
         let root_journal = temp_dir.path().join("main.beancount");
@@ -885,9 +889,9 @@ mod tests {
         use crate::server::LspServerStateSnapshot;
         use crossbeam_channel;
         use std::collections::HashMap;
-        use std::str::FromStr;
         use std::sync::Arc;
-
+        use std::str::FromStr;
+        
         let temp_dir = tempfile::tempdir().unwrap();
         let test_file = temp_dir.path().join("test.beancount");
         std::fs::write(&test_file, "2023-01-01 open Assets:Cash\n").unwrap();
