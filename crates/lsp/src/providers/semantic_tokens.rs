@@ -1,10 +1,10 @@
 use crate::server::LspServerStateSnapshot;
+use crate::treesitter_utils::LineIndex;
 use anyhow::Result;
 use lsp_types::{
     SemanticToken, SemanticTokenModifiers, SemanticTokenTypes, SemanticTokens,
     SemanticTokensLegend, SemanticTokensParams,
 };
-use ropey::Rope;
 use std::cmp::Ordering;
 use std::convert::TryFrom;
 use strum::IntoEnumIterator;
@@ -83,7 +83,8 @@ pub(crate) fn semantic_tokens_full(
         Ok(v) => v,
         Err(_) => return Ok(None),
     };
-    let content: Rope = doc.content.clone();
+    let content = doc.text_string();
+    let content = LineIndex::new(&content);
 
     let mut raw_tokens = Vec::new();
     collect_tokens(&tree.root_node(), &content, &mut raw_tokens, 0);
@@ -138,7 +139,7 @@ pub(crate) fn semantic_tokens_full(
 #[cfg(test)]
 pub(crate) fn bench_collect(
     tree: &tree_sitter_beancount::tree_sitter::Tree,
-    content: &Rope,
+    content: &LineIndex,
 ) -> usize {
     let mut out = Vec::new();
     collect_tokens(&tree.root_node(), content, &mut out, 0);
@@ -150,7 +151,7 @@ pub(crate) fn bench_collect(
 #[cfg(test)]
 pub(crate) fn bench_positions(
     tree: &tree_sitter_beancount::tree_sitter::Tree,
-    content: &Rope,
+    content: &LineIndex,
 ) -> usize {
     let mut cursor = tree.walk();
     let mut n = 0usize;
@@ -172,7 +173,7 @@ pub(crate) fn bench_positions(
     }
 }
 
-fn collect_tokens(node: &Node, content: &Rope, out: &mut Vec<RawToken>, depth: usize) {
+fn collect_tokens(node: &Node, content: &LineIndex, out: &mut Vec<RawToken>, depth: usize) {
     if depth > crate::treesitter_utils::MAX_TREE_DEPTH {
         tracing::warn!("semantic tokens: tree deeper than the walk limit, truncating");
         return;
@@ -251,29 +252,18 @@ fn classify_node(kind: NodeKind) -> Option<TokenKind> {
     }
 }
 
-fn to_semantic_token(node: &Node, content: &Rope, kind: TokenKind) -> Option<RawToken> {
-    let start_byte = node.start_byte();
-    let end_byte = node.end_byte();
-
-    let line = u32::try_from(content.byte_to_line(start_byte)).ok()?;
-    let start_char_idx = content.byte_to_char(start_byte);
-    let end_char_idx = content.byte_to_char(end_byte);
-
-    let line_start_char_idx = content.line_to_char(line as usize);
-    let line_start_utf16 = content.char_to_utf16_cu(line_start_char_idx);
-
-    let start_utf16 = content.char_to_utf16_cu(start_char_idx);
-    let end_utf16 = content.char_to_utf16_cu(end_char_idx);
-
-    let column_utf16 = start_utf16.checked_sub(line_start_utf16)?;
-    let length_utf16 = end_utf16.checked_sub(start_utf16)?;
+fn to_semantic_token(node: &Node, content: &LineIndex, kind: TokenKind) -> Option<RawToken> {
+    let start = content.position(node.start_byte());
+    // Token lengths are UTF-16 code units of the token's own text; tokens are
+    // short, so counting beats another index lookup.
+    let length_utf16 = content.slice(node).encode_utf16().count();
     if length_utf16 == 0 {
         return None;
     }
 
     Some(RawToken {
-        line,
-        start: u32::try_from(column_utf16).ok()?,
+        line: start.line,
+        start: start.character,
         length: u32::try_from(length_utf16).ok()?,
         token_type: token_index(kind),
         modifiers_bitset: 0,
@@ -347,7 +337,7 @@ mod tests {
             "2020-01-01 * \"x\"\n  Assets:A {}1 USD\n  Assets:B\n",
             "1+".repeat(100_000)
         );
-        let rope = Rope::from_str(&content);
+        let index = LineIndex::new(&content);
         let mut parser = tree_sitter_beancount::tree_sitter::Parser::new();
         parser
             .set_language(&tree_sitter_beancount::language())
@@ -355,7 +345,7 @@ mod tests {
         let tree = parser.parse(&content, None).unwrap();
 
         let mut out = Vec::new();
-        collect_tokens(&tree.root_node(), &rope, &mut out, 0);
+        collect_tokens(&tree.root_node(), &index, &mut out, 0);
     }
 
     #[test]
@@ -418,7 +408,7 @@ mod tests {
     #[test]
     fn test_to_semantic_token_basic() {
         // Create a simple beancount content
-        let content = ropey::Rope::from_str("2024-01-01 open Assets:Checking");
+        let index = LineIndex::new("2024-01-01 open Assets:Checking");
 
         // Parse with tree-sitter
         let mut parser = tree_sitter::Parser::new();
@@ -440,7 +430,7 @@ mod tests {
             .unwrap();
 
         // Convert to semantic token
-        let token = to_semantic_token(&date_node, &content, TokenKind::Number).unwrap();
+        let token = to_semantic_token(&date_node, &index, TokenKind::Number).unwrap();
 
         assert_eq!(token.line, 0);
         assert_eq!(token.start, 0); // Date starts at column 0
@@ -452,7 +442,7 @@ mod tests {
     #[test]
     fn test_to_semantic_token_with_utf8() {
         // Test with multi-byte UTF-8 content
-        let content = ropey::Rope::from_str("2024-01-01 * \"Café ☕\"");
+        let index = LineIndex::new("2024-01-01 * \"Café ☕\"");
 
         let mut parser = tree_sitter::Parser::new();
         parser
@@ -471,7 +461,7 @@ mod tests {
             .unwrap();
 
         // Convert to semantic token
-        let token = to_semantic_token(&narration_node, &content, TokenKind::String).unwrap();
+        let token = to_semantic_token(&narration_node, &index, TokenKind::String).unwrap();
 
         assert_eq!(token.line, 0);
         // UTF-16 length should account for multi-byte characters
@@ -481,7 +471,7 @@ mod tests {
 
     #[test]
     fn test_collect_tokens_simple() {
-        let content = ropey::Rope::from_str("2024-01-01 open Assets:Checking");
+        let index = LineIndex::new("2024-01-01 open Assets:Checking");
 
         let mut parser = tree_sitter::Parser::new();
         parser
@@ -492,7 +482,7 @@ mod tests {
             .unwrap();
 
         let mut tokens = Vec::new();
-        collect_tokens(&tree.root_node(), &content, &mut tokens, 0);
+        collect_tokens(&tree.root_node(), &index, &mut tokens, 0);
 
         // Should collect at least the date token
         assert!(!tokens.is_empty());
@@ -502,8 +492,7 @@ mod tests {
 
     #[test]
     fn test_collect_tokens_transaction() {
-        let content = ropey::Rope::from_str(
-            "2024-01-01 * \"Payee\" \"Narration\"\n  Assets:Cash  100.00 USD",
+        let index = LineIndex::new("2024-01-01 * \"Payee\" \"Narration\"\n  Assets:Cash  100.00 USD",
         );
 
         let mut parser = tree_sitter::Parser::new();
@@ -518,7 +507,7 @@ mod tests {
             .unwrap();
 
         let mut tokens = Vec::new();
-        collect_tokens(&tree.root_node(), &content, &mut tokens, 0);
+        collect_tokens(&tree.root_node(), &index, &mut tokens, 0);
 
         // Should collect multiple tokens: date, payee, narration, numbers, currency
         assert!(tokens.len() >= 4, "Should collect at least 4 tokens");
@@ -547,7 +536,7 @@ mod tests {
 
     #[test]
     fn test_collect_tokens_with_comments() {
-        let content = ropey::Rope::from_str("; Comment\n2024-01-01 open Assets:Checking");
+        let index = LineIndex::new("; Comment\n2024-01-01 open Assets:Checking");
 
         let mut parser = tree_sitter::Parser::new();
         parser
@@ -558,7 +547,7 @@ mod tests {
             .unwrap();
 
         let mut tokens = Vec::new();
-        collect_tokens(&tree.root_node(), &content, &mut tokens, 0);
+        collect_tokens(&tree.root_node(), &index, &mut tokens, 0);
 
         // Should have both comment and date tokens
         let has_comment = tokens

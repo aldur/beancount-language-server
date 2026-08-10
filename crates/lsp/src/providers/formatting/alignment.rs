@@ -5,7 +5,7 @@ use anyhow::Result;
 pub(super) fn generate_currency_column_edits(
     formateable_lines: &[FormatableLine],
     currency_col: usize,
-    doc: &crate::document::Document,
+    index: &crate::treesitter_utils::LineIndex,
     indent_width: Option<usize>,
 ) -> Vec<lsp_types::TextEdit> {
     let mut text_edits = Vec::new();
@@ -16,16 +16,8 @@ pub(super) fn generate_currency_column_edits(
             let account_part = line.prefix.trim_start().trim_end();
 
             // Check if this is a top-level directive that shouldn't be indented
-            let line_start_char = doc.content.line_to_char(line.line_num);
-            let line_end_char = if line.line_num + 1 < doc.content.len_lines() {
-                doc.content.line_to_char(line.line_num + 1)
-            } else {
-                doc.content.len_chars()
-            };
-            let full_line = doc
-                .content
-                .slice(line_start_char..line_end_char)
-                .to_string();
+
+            let full_line = index.line_text(line.line_num);
 
             let line_content = full_line.trim();
             let is_top_level_directive = line_content.contains("balance ")
@@ -69,7 +61,7 @@ pub(super) fn generate_currency_column_edits(
             line.rest.trim_start()
         );
 
-        if let Some(edit) = create_line_replacement_edit(line.line_num, &target_line, doc) {
+        if let Some(edit) = create_line_replacement_edit(line.line_num, &target_line, index) {
             text_edits.push(edit);
         }
     }
@@ -83,7 +75,7 @@ pub(super) fn generate_template_edits(
     config: &FormatConfig,
     number_currency_spacing: usize,
     indent_width: Option<usize>,
-    doc: &crate::document::Document,
+    index: &crate::treesitter_utils::LineIndex,
 ) -> Vec<lsp_types::TextEdit> {
     let mut text_edits = Vec::new();
 
@@ -116,16 +108,8 @@ pub(super) fn generate_template_edits(
 
             // Check if this is a top-level directive (like balance) that shouldn't be indented
             // Get the full line to check for directive keywords
-            let line_start_char = doc.content.line_to_char(line.line_num);
-            let line_end_char = if line.line_num + 1 < doc.content.len_lines() {
-                doc.content.line_to_char(line.line_num + 1)
-            } else {
-                doc.content.len_chars()
-            };
-            let full_line = doc
-                .content
-                .slice(line_start_char..line_end_char)
-                .to_string();
+
+            let full_line = index.line_text(line.line_num);
 
             // More comprehensive check for balance/price directives
             let line_content = full_line.trim();
@@ -170,7 +154,7 @@ pub(super) fn generate_template_edits(
             num_width = config.final_num_width
         );
 
-        if let Some(edit) = create_line_replacement_edit(line.line_num, &formatted_line, doc) {
+        if let Some(edit) = create_line_replacement_edit(line.line_num, &formatted_line, index) {
             text_edits.push(edit);
         }
     }
@@ -182,20 +166,9 @@ pub(super) fn generate_template_edits(
 fn create_line_replacement_edit(
     line_num: usize,
     new_content: &str,
-    doc: &crate::document::Document,
+    index: &crate::treesitter_utils::LineIndex,
 ) -> Option<lsp_types::TextEdit> {
-    // Calculate the range of the original line (without trailing newline)
-    let line_start_char = doc.content.line_to_char(line_num);
-    let line_end_char = if line_num + 1 < doc.content.len_lines() {
-        doc.content.line_to_char(line_num + 1)
-    } else {
-        doc.content.len_chars()
-    };
-
-    let original_line = doc
-        .content
-        .slice(line_start_char..line_end_char)
-        .to_string();
+    let original_line = index.line_text(line_num);
 
     // Skip edit if the line content hasn't changed
     // This optimization prevents unnecessary edits for already-formatted lines
@@ -229,7 +202,7 @@ fn create_line_replacement_edit(
 /// Applies indent normalization to lines not already handled by main formatting
 /// This ensures that indent changes don't conflict with amount/currency formatting
 pub(super) fn apply_indent_normalization_to_remaining_lines(
-    doc: &crate::document::Document,
+    index: &crate::treesitter_utils::LineIndex,
     _tree: &tree_sitter_beancount::tree_sitter::Tree,
     target_indent_width: usize,
     mut existing_edits: Vec<lsp_types::TextEdit>,
@@ -245,7 +218,7 @@ pub(super) fn apply_indent_normalization_to_remaining_lines(
         .collect();
 
     // Process all lines in the document
-    for line_num in 0..doc.content.len_lines() {
+    for line_num in 0..index.line_count() {
         let line_num_u32 = line_num as u32;
 
         // Skip lines that already have formatting edits
@@ -253,17 +226,7 @@ pub(super) fn apply_indent_normalization_to_remaining_lines(
             continue;
         }
 
-        let line_start_char = doc.content.line_to_char(line_num);
-        let line_end_char = if line_num + 1 < doc.content.len_lines() {
-            doc.content.line_to_char(line_num + 1)
-        } else {
-            doc.content.len_chars()
-        };
-
-        let current_line = doc
-            .content
-            .slice(line_start_char..line_end_char)
-            .to_string();
+        let current_line = index.line_text(line_num);
 
         // Only process lines that start with whitespace AND are likely to be postings/metadata
         // Don't normalize lines that contain top-level directive keywords at the start
@@ -288,7 +251,7 @@ pub(super) fn apply_indent_normalization_to_remaining_lines(
 
                     // Only create edit if indentation actually changes
                     if current_line.trim_end() != new_line.trim_end()
-                        && let Some(edit) = create_line_replacement_edit(line_num, &new_line, doc)
+                        && let Some(edit) = create_line_replacement_edit(line_num, &new_line, index)
                     {
                         existing_edits.push(edit);
                     }

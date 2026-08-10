@@ -1,10 +1,27 @@
 use crate::server::LspServerStateSnapshot;
-use crate::treesitter_utils::text_for_tree_sitter_node;
+use crate::treesitter_utils::LineIndex;
 use anyhow::Result;
 use lsp_types::{DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, SymbolKind};
-use ropey::Rope;
 use tree_sitter::Node;
 use tree_sitter_beancount::tree_sitter;
+
+/// Timing hook for the bench harness: extraction only, no serialisation.
+#[cfg(test)]
+pub(crate) fn bench_extract(
+    tree: &tree_sitter::Tree,
+    text: &str,
+) -> Vec<DocumentSymbol> {
+    let index = LineIndex::new(text);
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let mut out = Vec::new();
+    for child in root.children(&mut cursor) {
+        if let Some(symbol) = extract_symbol(&child, &index, 0) {
+            out.push(symbol);
+        }
+    }
+    out
+}
 
 /// Provider function for `textDocument/documentSymbol`.
 pub(crate) fn document_symbols(
@@ -29,12 +46,15 @@ pub(crate) fn document_symbols(
     };
 
     let content = match snapshot.open_docs.get(&uri) {
-        Some(doc) => doc.content.clone(),
+        Some(doc) => doc.text_string(),
         None => {
             tracing::warn!("Document not found in open_docs: {:?}", uri);
             return Ok(None);
         }
     };
+    // One linear scan, then every node's text and range is an integer lookup
+    // rather than a handful of rope walks.
+    let content = LineIndex::new(&content);
 
     let mut symbols = Vec::new();
     let root_node = tree.root_node();
@@ -51,7 +71,7 @@ pub(crate) fn document_symbols(
 }
 
 /// Extract a DocumentSymbol from a tree-sitter node.
-fn extract_symbol(node: &Node, content: &Rope, depth: usize) -> Option<DocumentSymbol> {
+fn extract_symbol(node: &Node, content: &LineIndex, depth: usize) -> Option<DocumentSymbol> {
     if depth > crate::treesitter_utils::MAX_TREE_DEPTH {
         tracing::warn!("document symbols: tree deeper than the walk limit, truncating");
         return None;
@@ -72,7 +92,7 @@ fn extract_symbol(node: &Node, content: &Rope, depth: usize) -> Option<DocumentS
 }
 
 /// Extract transaction symbol with postings as children.
-fn extract_transaction_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
+fn extract_transaction_symbol(node: &Node, content: &LineIndex) -> Option<DocumentSymbol> {
     let mut cursor = node.walk();
     let mut date = String::new();
     let mut flag = String::new();
@@ -83,16 +103,16 @@ fn extract_transaction_symbol(node: &Node, content: &Rope) -> Option<DocumentSym
     for child in node.children(&mut cursor) {
         match child.kind() {
             "date" => {
-                date = text_for_tree_sitter_node(content, &child);
+                date = content.slice(&child).to_string();
             }
             "txn" => {
-                flag = text_for_tree_sitter_node(content, &child);
+                flag = content.slice(&child).to_string();
             }
             "payee" => {
-                payee = text_for_tree_sitter_node(content, &child);
+                payee = content.slice(&child).to_string();
             }
             "narration" => {
-                narration = text_for_tree_sitter_node(content, &child);
+                narration = content.slice(&child).to_string();
             }
             "posting" => {
                 if let Some(posting_symbol) = extract_posting_symbol(&child, content) {
@@ -132,7 +152,7 @@ fn extract_transaction_symbol(node: &Node, content: &Rope) -> Option<DocumentSym
 }
 
 /// Extract posting symbol as a child of transaction.
-fn extract_posting_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
+fn extract_posting_symbol(node: &Node, content: &LineIndex) -> Option<DocumentSymbol> {
     let mut cursor = node.walk();
     let mut account = String::new();
     let mut amount = String::new();
@@ -140,11 +160,11 @@ fn extract_posting_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol>
     for child in node.children(&mut cursor) {
         match child.kind() {
             "account" => {
-                account = text_for_tree_sitter_node(content, &child);
+                account = content.slice(&child).to_string();
             }
             "incomplete_amount" | "amount" => {
                 // Extract the full amount text including number and currency
-                amount = text_for_tree_sitter_node(content, &child);
+                amount = content.slice(&child).to_string();
             }
             _ => {}
         }
@@ -170,7 +190,7 @@ fn extract_posting_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol>
 }
 
 /// Extract open account symbol.
-fn extract_open_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
+fn extract_open_symbol(node: &Node, content: &LineIndex) -> Option<DocumentSymbol> {
     let mut cursor = node.walk();
     let mut account = String::new();
     let mut currencies = Vec::new();
@@ -178,10 +198,10 @@ fn extract_open_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
     for child in node.children(&mut cursor) {
         match child.kind() {
             "account" => {
-                account = text_for_tree_sitter_node(content, &child);
+                account = content.slice(&child).to_string();
             }
             "currency" => {
-                currencies.push(text_for_tree_sitter_node(content, &child));
+                currencies.push(content.slice(&child).to_string());
             }
             _ => {}
         }
@@ -207,13 +227,13 @@ fn extract_open_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
 }
 
 /// Extract close account symbol.
-fn extract_close_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
+fn extract_close_symbol(node: &Node, content: &LineIndex) -> Option<DocumentSymbol> {
     let mut cursor = node.walk();
     let mut account = String::new();
 
     for child in node.children(&mut cursor) {
         if child.kind() == "account" {
-            account = text_for_tree_sitter_node(content, &child);
+            account = content.slice(&child).to_string();
             break;
         }
     }
@@ -232,7 +252,7 @@ fn extract_close_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
 }
 
 /// Extract balance assertion symbol.
-fn extract_balance_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
+fn extract_balance_symbol(node: &Node, content: &LineIndex) -> Option<DocumentSymbol> {
     let mut cursor = node.walk();
     let mut account = String::new();
     let mut amount = String::new();
@@ -240,10 +260,10 @@ fn extract_balance_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol>
     for child in node.children(&mut cursor) {
         match child.kind() {
             "account" => {
-                account = text_for_tree_sitter_node(content, &child);
+                account = content.slice(&child).to_string();
             }
             "amount" | "incomplete_amount" | "amount_tolerance" => {
-                amount = text_for_tree_sitter_node(content, &child);
+                amount = content.slice(&child).to_string();
             }
             _ => {}
         }
@@ -269,7 +289,7 @@ fn extract_balance_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol>
 }
 
 /// Extract price directive symbol.
-fn extract_price_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
+fn extract_price_symbol(node: &Node, content: &LineIndex) -> Option<DocumentSymbol> {
     let mut cursor = node.walk();
     let mut date = String::new();
     let mut currency = String::new();
@@ -278,13 +298,13 @@ fn extract_price_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
     for child in node.children(&mut cursor) {
         match child.kind() {
             "date" => {
-                date = text_for_tree_sitter_node(content, &child);
+                date = content.slice(&child).to_string();
             }
             "currency" if currency.is_empty() => {
-                currency = text_for_tree_sitter_node(content, &child);
+                currency = content.slice(&child).to_string();
             }
             "amount" | "incomplete_amount" => {
-                amount = text_for_tree_sitter_node(content, &child);
+                amount = content.slice(&child).to_string();
             }
             _ => {}
         }
@@ -306,13 +326,13 @@ fn extract_price_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
 }
 
 /// Extract commodity declaration symbol.
-fn extract_commodity_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
+fn extract_commodity_symbol(node: &Node, content: &LineIndex) -> Option<DocumentSymbol> {
     let mut cursor = node.walk();
     let mut currency = String::new();
 
     for child in node.children(&mut cursor) {
         if child.kind() == "currency" {
-            currency = text_for_tree_sitter_node(content, &child);
+            currency = content.slice(&child).to_string();
             break;
         }
     }
@@ -331,7 +351,7 @@ fn extract_commodity_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbo
 }
 
 /// Extract event directive symbol.
-fn extract_event_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
+fn extract_event_symbol(node: &Node, content: &LineIndex) -> Option<DocumentSymbol> {
     let mut cursor = node.walk();
     let mut date = String::new();
     let mut event_type = String::new();
@@ -340,13 +360,13 @@ fn extract_event_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
     for child in node.children(&mut cursor) {
         match child.kind() {
             "date" => {
-                date = text_for_tree_sitter_node(content, &child);
+                date = content.slice(&child).to_string();
             }
             "string" => {
                 if event_type.is_empty() {
-                    event_type = text_for_tree_sitter_node(content, &child);
+                    event_type = content.slice(&child).to_string();
                 } else if description.is_empty() {
-                    description = text_for_tree_sitter_node(content, &child);
+                    description = content.slice(&child).to_string();
                 }
             }
             _ => {}
@@ -369,7 +389,7 @@ fn extract_event_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
 }
 
 /// Extract option directive symbol.
-fn extract_option_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
+fn extract_option_symbol(node: &Node, content: &LineIndex) -> Option<DocumentSymbol> {
     let mut cursor = node.walk();
     let mut option_name = String::new();
     let mut option_value = String::new();
@@ -377,9 +397,9 @@ fn extract_option_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> 
     for child in node.children(&mut cursor) {
         if child.kind() == "string" {
             if option_name.is_empty() {
-                option_name = text_for_tree_sitter_node(content, &child);
+                option_name = content.slice(&child).to_string();
             } else if option_value.is_empty() {
-                option_value = text_for_tree_sitter_node(content, &child);
+                option_value = content.slice(&child).to_string();
             }
         }
     }
@@ -402,7 +422,7 @@ fn extract_option_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> 
 /// Extract section symbol (org-mode and markdown sections parsed by tree-sitter-beancount).
 /// Sections are hierarchical with "headline" and nested "section" children.
 /// Supports both org-mode (* headers) and markdown (# headers).
-fn extract_section_symbol(node: &Node, content: &Rope, depth: usize) -> Option<DocumentSymbol> {
+fn extract_section_symbol(node: &Node, content: &LineIndex, depth: usize) -> Option<DocumentSymbol> {
     if depth > crate::treesitter_utils::MAX_TREE_DEPTH {
         tracing::warn!("document symbols: sections nested deeper than the walk limit, truncating");
         return None;
@@ -416,7 +436,7 @@ fn extract_section_symbol(node: &Node, content: &Rope, depth: usize) -> Option<D
     for child in node.children(&mut cursor) {
         match child.kind() {
             "headline" => {
-                let text = text_for_tree_sitter_node(content, &child);
+                let text = content.slice(&child).to_string();
                 let trimmed = text.trim();
 
                 // Check for org-mode style (* headers)
@@ -475,8 +495,8 @@ fn extract_section_symbol(node: &Node, content: &Rope, depth: usize) -> Option<D
 
 /// Extract heading symbol from comment lines (markdown style).
 /// Markdown: `# Heading`, `## Subheading`
-fn extract_heading_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
-    let text = text_for_tree_sitter_node(content, node);
+fn extract_heading_symbol(node: &Node, content: &LineIndex) -> Option<DocumentSymbol> {
+    let text = content.slice(node).to_string();
     let trimmed = text.trim();
 
     // Check for markdown style (# headers)
@@ -516,10 +536,9 @@ fn extract_heading_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol>
 
 /// Convert a tree-sitter node to an LSP Range.
 ///
-/// Point.column is a byte offset; LSP characters are UTF-16 code units, so
-/// the conversion must go through the rope.
-fn node_to_range(content: &Rope, node: &Node) -> lsp_types::Range {
-    crate::treesitter_utils::tree_sitter_node_to_lsp_range(content, node)
+/// Point.column is a byte offset; LSP characters are UTF-16 code units.
+fn node_to_range(content: &LineIndex, node: &Node) -> lsp_types::Range {
+    content.range(node)
 }
 
 #[cfg(test)]

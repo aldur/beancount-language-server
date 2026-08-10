@@ -43,8 +43,13 @@ pub(crate) fn formatting(
         }
     };
 
+    // One index for the whole request: formatting touches every line, and
+    // rope lookups per line were the bulk of its cost.
+    let text = doc.text_string();
+    let index = crate::treesitter_utils::LineIndex::new(&text);
+
     // Extract formateable lines using tree-sitter
-    let formateable_lines = match extract_formateable_lines(doc, tree) {
+    let formateable_lines = match extract_formateable_lines(&index, tree) {
         Ok(lines) => {
             tracing::debug!("Extracted {} formateable lines", lines.len());
             lines
@@ -68,7 +73,7 @@ pub(crate) fn formatting(
             generate_currency_column_edits(
                 &formateable_lines,
                 currency_col,
-                doc,
+                &index,
                 snapshot.config.formatting.indent_width,
             )
         } else {
@@ -77,14 +82,14 @@ pub(crate) fn formatting(
                 &format_config,
                 snapshot.config.formatting.number_currency_spacing,
                 snapshot.config.formatting.indent_width,
-                doc,
+                &index,
             )
         }
     };
 
     // Apply indent normalization to remaining lines if configured
     let final_text_edits = if let Some(indent_width) = snapshot.config.formatting.indent_width {
-        apply_indent_normalization_to_remaining_lines(doc, tree, indent_width, text_edits)?
+        apply_indent_normalization_to_remaining_lines(&index, tree, indent_width, text_edits)?
     } else {
         text_edits
     };

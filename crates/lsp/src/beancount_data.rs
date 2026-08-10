@@ -841,12 +841,32 @@ mod bench {
 
         // provider-level costs on the same document
         let t = Instant::now();
-        let toks = crate::providers::semantic_tokens::bench_collect(&tree, &rope);
+        let bench_index = crate::treesitter_utils::LineIndex::new(&text);
+        let toks = crate::providers::semantic_tokens::bench_collect(&tree, &bench_index);
         eprintln!("collect_tokens:   {:?} ({toks} tokens)", t.elapsed());
 
         let t = Instant::now();
-        let n = crate::providers::semantic_tokens::bench_positions(&tree, &rope);
+        let n = crate::providers::semantic_tokens::bench_positions(&tree, &bench_index);
         eprintln!("position convs:   {:?} ({n} nodes)", t.elapsed());
+
+        let t = Instant::now();
+        let syms = crate::providers::document_symbol::bench_extract(&tree, &text);
+        eprintln!("documentSymbol:   {:?} ({} symbols)", t.elapsed(), syms.len());
+
+        let t = Instant::now();
+        let json = serde_json::to_string(&syms).unwrap();
+        eprintln!("  serialise:      {:?} ({} MB)", t.elapsed(), json.len() / 1_048_576);
+
+        let t = Instant::now();
+        let index = crate::treesitter_utils::LineIndex::new(&text);
+        eprintln!("  LineIndex:      {:?}", t.elapsed());
+        let t = Instant::now();
+        let mut acc = 0usize;
+        for i in (0..text.len()).step_by(7) {
+            acc += index.position(i).character as usize;
+        }
+        eprintln!("  {} positions:  {:?}", text.len() / 7, t.elapsed());
+        assert!(acc > 0);
 
         let t = Instant::now();
         let mut count = 0usize;

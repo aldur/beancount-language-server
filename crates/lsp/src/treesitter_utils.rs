@@ -45,6 +45,126 @@ pub(crate) fn parse_with_budget(
     tree
 }
 
+/// Byte-offset → LSP position lookups over a `&str`, without a rope.
+///
+/// The providers that walk whole documents (symbols, semantic tokens) used to
+/// convert every node through the rope: `byte_to_lsp_position` alone is five
+/// O(log n) tree walks, and a symbol costs two of those plus a text slice per
+/// field. On a 240k-line ledger that is millions of walks and seconds per
+/// request.
+///
+/// Building this index is one linear scan; each lookup is then an integer
+/// binary search, plus — only for lines that actually contain non-ASCII — a
+/// short scan of the line prefix.
+pub(crate) struct LineIndex<'a> {
+    text: &'a str,
+    /// Byte offset where each line starts; always begins with 0.
+    line_starts: Vec<u32>,
+    /// Whether each line is pure ASCII, in which case the UTF-16 column is
+    /// simply the byte offset within the line.
+    line_ascii: Vec<bool>,
+}
+
+impl<'a> LineIndex<'a> {
+    pub(crate) fn new(text: &'a str) -> Self {
+        let bytes = text.as_bytes();
+        let mut line_starts = Vec::with_capacity(bytes.len() / 32 + 1);
+        let mut line_ascii = Vec::with_capacity(bytes.len() / 32 + 1);
+        line_starts.push(0);
+        let mut ascii = true;
+        for (i, &b) in bytes.iter().enumerate() {
+            if !b.is_ascii() {
+                ascii = false;
+            }
+            if b == b'\n' {
+                line_ascii.push(ascii);
+                ascii = true;
+                line_starts.push((i + 1) as u32);
+            }
+        }
+        line_ascii.push(ascii);
+        Self {
+            text,
+            line_starts,
+            line_ascii,
+        }
+    }
+
+    /// The whole document.
+    pub(crate) fn text(&self) -> &'a str {
+        self.text
+    }
+
+    /// The line containing `byte`.
+    fn line_of(&self, byte: usize) -> usize {
+        // `line_starts` is sorted and starts at 0, so this never underflows.
+        self.line_starts.partition_point(|&start| start as usize <= byte) - 1
+    }
+
+    /// Largest char boundary at or below `byte`, clamped to the document.
+    fn floor_boundary(&self, byte: usize) -> usize {
+        let mut byte = byte.min(self.text.len());
+        while byte > 0 && !self.text.is_char_boundary(byte) {
+            byte -= 1;
+        }
+        byte
+    }
+
+    /// LSP position (line, UTF-16 column) of a byte offset.
+    pub(crate) fn position(&self, byte: usize) -> lsp_types::Position {
+        let byte = self.floor_boundary(byte);
+        let line = self.line_of(byte);
+        let start = self.line_starts[line] as usize;
+        let column = if self.line_ascii[line] {
+            (byte - start) as u32
+        } else {
+            self.text[start..byte].encode_utf16().count() as u32
+        };
+        lsp_types::Position::new(line as u32, column)
+    }
+
+    /// LSP range covering a node.
+    pub(crate) fn range(&self, node: &tree_sitter::Node) -> lsp_types::Range {
+        lsp_types::Range {
+            start: self.position(node.start_byte()),
+            end: self.position(node.end_byte()),
+        }
+    }
+
+    /// Byte offset where a line begins (clamped to the last line).
+    pub(crate) fn line_start_byte(&self, line: usize) -> usize {
+        let line = line.min(self.line_starts.len() - 1);
+        self.line_starts[line] as usize
+    }
+
+    /// Byte offset just past a line, i.e. the start of the next one. Includes
+    /// the line's own terminator, matching a rope's `line_to_char(n + 1)`.
+    pub(crate) fn line_end_byte(&self, line: usize) -> usize {
+        match self.line_starts.get(line + 1) {
+            Some(&next) => next as usize,
+            None => self.text.len(),
+        }
+    }
+
+    /// Number of lines, counted the way a rope does (a trailing newline
+    /// yields one final empty line).
+    pub(crate) fn line_count(&self) -> usize {
+        self.line_starts.len()
+    }
+
+    /// A line's text, terminator included.
+    pub(crate) fn line_text(&self, line: usize) -> &'a str {
+        &self.text[self.line_start_byte(line)..self.line_end_byte(line)]
+    }
+
+    /// A node's source text, borrowed rather than copied.
+    pub(crate) fn slice(&self, node: &tree_sitter::Node) -> &'a str {
+        let start = self.floor_boundary(node.start_byte());
+        let end = self.floor_boundary(node.end_byte()).max(start);
+        &self.text[start..end]
+    }
+}
+
 /// Maximum tree depth the recursive walkers will descend.
 ///
 /// Real ledgers nest a handful of levels; pathological input does not.
@@ -482,6 +602,49 @@ mod tests {
         );
         let edit = lsp_textdocchange_to_ts_inputedit(&source, &change).unwrap();
         assert_eq!(edit.new_end_position, Point::new(3, 2));
+    }
+
+    #[test]
+    fn test_line_index_matches_rope_at_every_offset() {
+        // The index replaces the rope in the hot providers, so it has to agree
+        // with it everywhere — including around multibyte and astral
+        // characters, CRLF, and the very end of the document.
+        let documents = [
+            "",
+            "\n",
+            "2020-01-01 open Assets:Cash EUR\n",
+            "2020-01-01 open Assets:Caffè EUR\n  ; é comment\n",
+            "2024-01-02 * \"Café ☕\" \"日本語 🎉\"\r\n  Expenses:Caffè  2.50 EUR\r\n",
+            "no trailing newline 🎉",
+            "a\r\nb\rc\nd",
+            "🎉🎉🎉\n🎉\n",
+        ];
+        for text in documents {
+            let rope = Rope::from_str(text);
+            let index = LineIndex::new(text);
+            for byte in 0..=text.len() {
+                if !text.is_char_boundary(byte) {
+                    continue;
+                }
+                assert_eq!(
+                    index.position(byte),
+                    byte_to_lsp_position(&rope, byte),
+                    "offset {byte} of {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_line_index_clamps_and_slices() {
+        let text = "2020-01-01 open Assets:Caffè EUR\n";
+        let index = LineIndex::new(text);
+        // Past the end clamps to the document end.
+        let last = index.position(text.len());
+        assert_eq!(index.position(text.len() + 999), last);
+        // Interior of a multibyte character floors to its start.
+        let e_start = text.find('è').unwrap();
+        assert_eq!(index.position(e_start + 1), index.position(e_start));
     }
 
     #[test]

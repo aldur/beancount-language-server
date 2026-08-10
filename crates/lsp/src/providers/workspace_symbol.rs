@@ -1,11 +1,10 @@
 use crate::server::LspServerStateSnapshot;
-use crate::treesitter_utils::text_for_tree_sitter_node;
+use crate::treesitter_utils::LineIndex;
 use anyhow::Result;
 use lsp_types::{
     BaseSymbolInformation, Location, SymbolInformation, SymbolKind, WorkspaceSymbolParams,
     WorkspaceSymbolResponse,
 };
-use ropey::Rope;
 use std::str::FromStr;
 use tree_sitter_beancount::tree_sitter::Node;
 use tree_sitter_beancount::tree_sitter::StreamingIterator;
@@ -24,15 +23,18 @@ pub(crate) fn workspace_symbols(
         // Open buffer first, then the cached rope: a workspace-wide search
         // must cover the whole forest, not just currently-open buffers.
         let content = match snapshot.open_docs.get(path) {
-            Some(doc) => &doc.content,
+            Some(doc) => doc.text_string(),
             None => match snapshot.forest_content.get(path) {
-                Some(stored) => stored.as_ref(),
+                Some(stored) => stored.to_string(),
                 None => {
                     tracing::debug!("No cached content for forest file: {:?}", path);
                     continue;
                 }
             },
         };
+        // Indexed once per file, not walked per node (this scans every file in
+        // the forest on every query).
+        let content = &LineIndex::new(&content);
 
         let url = match Url::from_file_path(path) {
             Ok(url) => url,
@@ -121,7 +123,7 @@ pub(crate) fn workspace_symbols(
 /// Extract account open symbol if it matches the query.
 fn extract_account_symbol(
     node: &Node,
-    content: &Rope,
+    content: &LineIndex,
     uri: &lsp_types::Uri,
     query: &str,
 ) -> Option<SymbolInformation> {
@@ -130,7 +132,7 @@ fn extract_account_symbol(
 
     for child in node.children(&mut cursor) {
         if child.kind() == "account" {
-            account = text_for_tree_sitter_node(content, &child);
+            account = content.slice(&child).to_string();
             break;
         }
     }
@@ -158,7 +160,7 @@ fn extract_account_symbol(
 /// Extract transaction symbol if payee or narration matches the query.
 fn extract_transaction_symbol(
     node: &Node,
-    content: &Rope,
+    content: &LineIndex,
     uri: &lsp_types::Uri,
     query: &str,
 ) -> Option<SymbolInformation> {
@@ -171,16 +173,16 @@ fn extract_transaction_symbol(
     for child in node.children(&mut cursor) {
         match child.kind() {
             "date" => {
-                date = text_for_tree_sitter_node(content, &child);
+                date = content.slice(&child).to_string();
             }
             "txn" => {
-                flag = text_for_tree_sitter_node(content, &child);
+                flag = content.slice(&child).to_string();
             }
             "payee" => {
-                payee = text_for_tree_sitter_node(content, &child);
+                payee = content.slice(&child).to_string();
             }
             "narration" => {
-                narration = text_for_tree_sitter_node(content, &child);
+                narration = content.slice(&child).to_string();
             }
             _ => {}
         }
@@ -222,7 +224,7 @@ fn extract_transaction_symbol(
 /// Extract tags and links using tree-sitter query.
 fn extract_tags_and_links_query(
     tree: &tree_sitter_beancount::tree_sitter::Tree,
-    content: &Rope,
+    content: &LineIndex,
     uri: &lsp_types::Uri,
     query_str: &str,
     symbols: &mut Vec<SymbolInformation>,
@@ -239,9 +241,9 @@ fn extract_tags_and_links_query(
     )
     .expect("Failed to compile tag/link query");
 
-    let content_bytes = content.to_string().into_bytes();
+    let content_bytes = content.text().as_bytes();
     let mut cursor_qry = tree_sitter::QueryCursor::new();
-    let mut matches = cursor_qry.matches(&query, tree.root_node(), content_bytes.as_slice());
+    let mut matches = cursor_qry.matches(&query, tree.root_node(), content_bytes);
 
     let tag_idx = query
         .capture_index_for_name("tag")
@@ -252,7 +254,7 @@ fn extract_tags_and_links_query(
 
     while let Some(qmatch) = matches.next() {
         for capture in qmatch.captures {
-            let text = text_for_tree_sitter_node(content, &capture.node);
+            let text = content.slice(&capture.node).to_string();
 
             if capture.index == tag_idx {
                 // Tag node - text already includes the #
@@ -298,7 +300,7 @@ fn extract_tags_and_links_query(
 /// Extract commodity symbol if it matches the query.
 fn extract_commodity_symbol(
     node: &Node,
-    content: &Rope,
+    content: &LineIndex,
     uri: &lsp_types::Uri,
     query: &str,
 ) -> Option<SymbolInformation> {
@@ -307,7 +309,7 @@ fn extract_commodity_symbol(
 
     for child in node.children(&mut cursor) {
         if child.kind() == "currency" {
-            currency = text_for_tree_sitter_node(content, &child);
+            currency = content.slice(&child).to_string();
             break;
         }
     }
@@ -335,7 +337,7 @@ fn extract_commodity_symbol(
 /// Extract price symbol if currency matches the query.
 fn extract_price_symbol(
     node: &Node,
-    content: &Rope,
+    content: &LineIndex,
     uri: &lsp_types::Uri,
     query: &str,
 ) -> Option<SymbolInformation> {
@@ -347,13 +349,13 @@ fn extract_price_symbol(
     for child in node.children(&mut cursor) {
         match child.kind() {
             "date" => {
-                date = text_for_tree_sitter_node(content, &child);
+                date = content.slice(&child).to_string();
             }
             "currency" if currency.is_empty() => {
-                currency = text_for_tree_sitter_node(content, &child);
+                currency = content.slice(&child).to_string();
             }
             "amount" | "incomplete_amount" => {
-                amount = text_for_tree_sitter_node(content, &child);
+                amount = content.slice(&child).to_string();
             }
             _ => {}
         }
@@ -382,11 +384,8 @@ fn extract_price_symbol(
 }
 
 /// Convert a tree-sitter node to an LSP Range.
-///
-/// Point.column is a byte offset; LSP characters are UTF-16 code units, so
-/// the conversion must go through the rope.
-fn node_to_range(content: &Rope, node: &Node) -> lsp_types::Range {
-    crate::treesitter_utils::tree_sitter_node_to_lsp_range(content, node)
+fn node_to_range(content: &LineIndex, node: &Node) -> lsp_types::Range {
+    content.range(node)
 }
 
 #[cfg(test)]
