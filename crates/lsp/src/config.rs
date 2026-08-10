@@ -113,23 +113,33 @@ impl Config {
 
         // Update formatting configuration
         if let Some(formatting) = beancount_lsp_settings.formatting {
+            // Widths and spacings become `format!` padding: an absurd value (a
+            // typo'd config) makes every formatting response carry megabytes
+            // of spaces. Clamp to something no real ledger exceeds.
+            const MAX_WIDTH: usize = 1024;
+            let clamp = |name: &str, value: usize| {
+                if value > MAX_WIDTH {
+                    tracing::warn!("formatting.{} = {} clamped to {}", name, value, MAX_WIDTH);
+                }
+                value.min(MAX_WIDTH)
+            };
             if let Some(prefix_width) = formatting.prefix_width {
-                self.formatting.prefix_width = Some(prefix_width);
+                self.formatting.prefix_width = Some(clamp("prefix_width", prefix_width));
             }
             if let Some(num_width) = formatting.num_width {
-                self.formatting.num_width = Some(num_width);
+                self.formatting.num_width = Some(clamp("num_width", num_width));
             }
             if let Some(currency_column) = formatting.currency_column {
-                self.formatting.currency_column = Some(currency_column);
+                self.formatting.currency_column = Some(clamp("currency_column", currency_column));
             }
             if let Some(spacing) = formatting.account_amount_spacing {
-                self.formatting.account_amount_spacing = spacing;
+                self.formatting.account_amount_spacing = clamp("account_amount_spacing", spacing);
             }
             if let Some(spacing) = formatting.number_currency_spacing {
-                self.formatting.number_currency_spacing = spacing;
+                self.formatting.number_currency_spacing = clamp("number_currency_spacing", spacing);
             }
             if let Some(indent_width) = formatting.indent_width {
-                self.formatting.indent_width = Some(indent_width);
+                self.formatting.indent_width = Some(clamp("indent_width", indent_width));
             }
         }
 
