@@ -51,8 +51,10 @@ impl PostingAmount {
                 // {{total}} means total cost, use the cost amount directly
                 cost.amount.value
             } else {
-                // {unit} means unit cost, multiply by quantity
-                self.amount.value * cost.amount.value
+                // {unit} means unit cost, multiply by quantity.
+                // Checked: rust_decimal's plain operators panic on overflow,
+                // and these values come straight from whatever the user typed.
+                self.amount.value.checked_mul(cost.amount.value)?
             };
             Some((converted_value, cost.amount.currency.clone()))
         } else if let Some(price) = &self.price {
@@ -61,8 +63,8 @@ impl PostingAmount {
                 // @@ means total cost, use the price amount directly
                 price.amount.value
             } else {
-                // @ means unit price, multiply by quantity
-                self.amount.value * price.amount.value
+                // @ means unit price, multiply by quantity (checked, as above)
+                self.amount.value.checked_mul(price.amount.value)?
             };
             Some((converted_value, price.amount.currency.clone()))
         } else {
@@ -423,7 +425,7 @@ fn evaluate_expression(expr: &str) -> Option<rust_decimal::Decimal> {
         let right = expr[pos + 1..].trim();
         let left_val = Decimal::from_str_exact(left).ok()?;
         let right_val = Decimal::from_str_exact(right).ok()?;
-        return Some(left_val * right_val);
+        return left_val.checked_mul(right_val);
     }
 
     if let Some(pos) = expr.rfind('+') {
@@ -431,7 +433,7 @@ fn evaluate_expression(expr: &str) -> Option<rust_decimal::Decimal> {
         let right = expr[pos + 1..].trim();
         let left_val = Decimal::from_str_exact(left).ok()?;
         let right_val = Decimal::from_str_exact(right).ok()?;
-        return Some(left_val + right_val);
+        return left_val.checked_add(right_val);
     }
 
     // Handle subtraction (but not unary minus)
@@ -444,7 +446,7 @@ fn evaluate_expression(expr: &str) -> Option<rust_decimal::Decimal> {
             Decimal::from_str_exact(left),
             Decimal::from_str_exact(right),
         ) {
-            return Some(left_val - right_val);
+            return left_val.checked_sub(right_val);
         }
     }
 
@@ -467,14 +469,16 @@ fn calculate_balancing_hint(postings: &[Posting], content: &ropey::Rope) -> Opti
                 posting_amount.convert_to_currency()
             {
                 // Use the converted amount and currency
-                *totals
+                let entry = totals
                     .entry(converted_currency)
-                    .or_insert(rust_decimal::Decimal::ZERO) += converted_value;
+                    .or_insert(rust_decimal::Decimal::ZERO);
+                *entry = entry.checked_add(converted_value)?;
             } else {
                 // Use the original amount and currency
-                *totals
+                let entry = totals
                     .entry(posting_amount.amount.currency.clone())
-                    .or_insert(rust_decimal::Decimal::ZERO) += posting_amount.amount.value;
+                    .or_insert(rust_decimal::Decimal::ZERO);
+                *entry = entry.checked_add(posting_amount.amount.value)?;
             }
         }
     }
@@ -600,14 +604,16 @@ fn calculate_total_hint(postings: &[Posting], position: Position) -> Option<Inla
                 posting_amount.convert_to_currency()
             {
                 // Use the converted amount and currency
-                *totals
+                let entry = totals
                     .entry(converted_currency)
-                    .or_insert(rust_decimal::Decimal::ZERO) += converted_value;
+                    .or_insert(rust_decimal::Decimal::ZERO);
+                *entry = entry.checked_add(converted_value)?;
             } else {
                 // Use the original amount and currency
-                *totals
+                let entry = totals
                     .entry(posting_amount.amount.currency.clone())
-                    .or_insert(rust_decimal::Decimal::ZERO) += posting_amount.amount.value;
+                    .or_insert(rust_decimal::Decimal::ZERO);
+                *entry = entry.checked_add(posting_amount.amount.value)?;
             }
         }
     }
