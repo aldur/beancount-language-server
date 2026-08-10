@@ -524,10 +524,32 @@ fn create_completion_with_insert_replace(
     }
 }
 
+/// LSP UTF-16 code-unit column -> index into `chars`, clamped to its length.
+/// The two are only interchangeable while every char is BMP; an emoji before
+/// the cursor makes the raw UTF-16 column overshoot the char vector.
+fn utf16_col_to_char_idx(chars: &[char], utf16_col: usize) -> usize {
+    let mut units = 0;
+    for (i, c) in chars.iter().enumerate() {
+        if units >= utf16_col {
+            return i;
+        }
+        units += c.len_utf16();
+    }
+    chars.len()
+}
+
+/// Char index -> LSP UTF-16 code-unit column (inverse of the above).
+fn char_idx_to_utf16_col(chars: &[char], idx: usize) -> usize {
+    chars[..idx.min(chars.len())]
+        .iter()
+        .map(|c| c.len_utf16())
+        .sum()
+}
+
 /// Calculate word ranges for InsertReplaceEdit
 fn calculate_word_ranges(line: &str, position: Position) -> (Range, Range) {
     let chars: Vec<char> = line.chars().collect();
-    let cursor_col = position.character as usize;
+    let cursor_col = utf16_col_to_char_idx(&chars, position.character as usize);
 
     // Find start of word
     let mut start = cursor_col;
@@ -549,10 +571,11 @@ fn calculate_word_ranges(line: &str, position: Position) -> (Range, Range) {
         end += 1;
     }
 
+    // start/end are char indices; LSP wants UTF-16 columns back.
     let insert_range = Range {
         start: Position {
             line: position.line,
-            character: start as u32,
+            character: char_idx_to_utf16_col(&chars, start) as u32,
         },
         end: position,
     };
@@ -560,11 +583,11 @@ fn calculate_word_ranges(line: &str, position: Position) -> (Range, Range) {
     let replace_range = Range {
         start: Position {
             line: position.line,
-            character: start as u32,
+            character: char_idx_to_utf16_col(&chars, start) as u32,
         },
         end: Position {
             line: position.line,
-            character: end as u32,
+            character: char_idx_to_utf16_col(&chars, end) as u32,
         },
     };
 
@@ -578,7 +601,7 @@ fn calculate_string_ranges(
     has_closing_quote: bool,
 ) -> (Range, Range) {
     let chars: Vec<char> = line.chars().collect();
-    let cursor_col = position.character as usize;
+    let cursor_col = utf16_col_to_char_idx(&chars, position.character as usize);
 
     // Find opening quote
     let mut start = cursor_col;
@@ -600,10 +623,11 @@ fn calculate_string_ranges(
         }
     }
 
+    // start/end are char indices; LSP wants UTF-16 columns back.
     let insert_range = Range {
         start: Position {
             line: position.line,
-            character: start as u32,
+            character: char_idx_to_utf16_col(&chars, start) as u32,
         },
         end: position,
     };
@@ -611,11 +635,11 @@ fn calculate_string_ranges(
     let replace_range = Range {
         start: Position {
             line: position.line,
-            character: start as u32,
+            character: char_idx_to_utf16_col(&chars, start) as u32,
         },
         end: Position {
             line: position.line,
-            character: end as u32,
+            character: char_idx_to_utf16_col(&chars, end) as u32,
         },
     };
 

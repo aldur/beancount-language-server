@@ -30,7 +30,30 @@ pub(crate) fn completion(
     let (tree, doc) = snapshot.tree_and_document_for_uri(&cursor.text_document.uri)?;
 
     let content = &doc.content;
-    let cursor_point = lsp_position_to_tree_sitter_point(content, cursor.position)?;
+
+    // Clamp the position to the document before anything indexes the rope
+    // with it: clients send stale positions during rapid edits, and an
+    // out-of-bounds line panics the pool thread — the request then never
+    // gets an answer.
+    let position = {
+        let line_idx = (cursor.position.line as usize).min(content.len_lines().saturating_sub(1));
+        let line = content.line(line_idx);
+        let mut line_utf16 = line.len_utf16_cu();
+        // Exclude the trailing line break from the clamp target.
+        for ch in line.chars_at(line.len_chars()).reversed() {
+            if ch == '\n' || ch == '\r' {
+                line_utf16 -= 1;
+            } else {
+                break;
+            }
+        }
+        lsp_types::Position::new(
+            line_idx as u32,
+            (cursor.position.character as usize).min(line_utf16) as u32,
+        )
+    };
+
+    let cursor_point = lsp_position_to_tree_sitter_point(content, position)?;
 
     // Determine completion context using left-context-aware analysis
     let ctx = context::determine_completion_context(tree, content, cursor_point, trigger_character);
@@ -42,7 +65,7 @@ pub(crate) fn completion(
         &snapshot.beancount_data,
         &ctx,
         content,
-        cursor.position,
+        position,
         &snapshot.config,
     )?;
 

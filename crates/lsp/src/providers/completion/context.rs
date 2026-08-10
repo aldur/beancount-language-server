@@ -120,7 +120,16 @@ pub(super) fn determine_completion_context(
         // Step out of ERROR and MISSING nodes
         while current_node.kind() == "ERROR" || current_node.is_missing() {
             let start_pos = current_node.start_position();
-            if content.line(start_pos.row).char(start_pos.column) == '"' {
+            // Point.column is a byte offset; RopeSlice::char wants a char
+            // index — and panics on out-of-bounds, so convert and probe
+            // gracefully.
+            let line = content.line(start_pos.row);
+            let starts_with_quote = line
+                .try_byte_to_char(start_pos.column)
+                .ok()
+                .and_then(|char_idx| line.get_char(char_idx))
+                == Some('"');
+            if starts_with_quote {
                 debug!("Found an ERROR node starting with '\"'. Assuming unterminated string.");
                 return analyze_string_context(content, cursor);
             }
@@ -483,8 +492,15 @@ fn safe_substring_to_byte(s: &str, byte_offset: usize) -> &str {
 
 /// Extract account prefix from line text up to cursor position
 fn extract_account_prefix(line: &str, cursor_col: usize) -> String {
+    // `cursor_col` is a tree-sitter byte column; floor it to a char boundary
+    // and index chars with a char index, or multibyte lines slice garbage.
+    let mut byte_col = cursor_col.min(line.len());
+    while byte_col > 0 && !line.is_char_boundary(byte_col) {
+        byte_col -= 1;
+    }
+    let cursor_col = line[..byte_col].chars().count();
     let chars: Vec<char> = line.chars().collect();
-    if cursor_col == 0 || cursor_col > chars.len() {
+    if cursor_col == 0 {
         return String::new();
     }
 
@@ -505,8 +521,15 @@ fn extract_account_prefix(line: &str, cursor_col: usize) -> String {
 
 /// Extract string prefix from line text up to cursor position
 fn extract_string_prefix(line: &str, cursor_col: usize) -> String {
+    // `cursor_col` is a tree-sitter byte column; floor it to a char boundary
+    // and index chars with a char index, or multibyte lines slice garbage.
+    let mut byte_col = cursor_col.min(line.len());
+    while byte_col > 0 && !line.is_char_boundary(byte_col) {
+        byte_col -= 1;
+    }
+    let cursor_col = line[..byte_col].chars().count();
     let chars: Vec<char> = line.chars().collect();
-    if cursor_col == 0 || cursor_col > chars.len() {
+    if cursor_col == 0 {
         return String::new();
     }
 
