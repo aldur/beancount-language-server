@@ -82,7 +82,14 @@ fn fold_transaction(node: &Node, content: &Rope) -> Option<FoldingRange> {
     }
 
     let start_line = node.start_position().row;
-    let end_line = node.end_position().row;
+    // A transaction node ends at column 0 of the line after its last
+    // posting; folding to that row swallows the following (blank) line and
+    // visually merges adjacent transactions.
+    let end_line = if node.end_position().column == 0 {
+        node.end_position().row.saturating_sub(1).max(start_line)
+    } else {
+        node.end_position().row
+    };
 
     // Create collapsed text showing the first line (date and narration)
     let collapsed_text = extract_transaction_summary(node, content);
