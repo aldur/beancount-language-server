@@ -136,6 +136,21 @@ fn extract_line_components(
         .content
         .byte_to_char(number_end_byte)
         .min(doc.content.len_chars());
+
+    // The rebuilt line is prefix + padding + number + rest: anything between
+    // the prefix and the number that is not whitespace (mid-edit garbage the
+    // grammar error-recovered around) would be silently deleted by the
+    // rebuild — such a line is not formateable.
+    if number_node.start_position().row != line_num
+        || number_start_char < prefix_end_char
+        || doc
+            .content
+            .slice(prefix_end_char..number_start_char)
+            .chars()
+            .any(|c| !c.is_whitespace())
+    {
+        return None;
+    }
     let number_text = doc
         .content
         .slice(number_start_char..number_end_char)
