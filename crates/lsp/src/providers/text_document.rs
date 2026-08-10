@@ -151,6 +151,10 @@ pub(crate) fn did_save(
 
     if let Ok(uri) = params.text_document.uri.to_file_path() {
         state.doc_store.ensure_beancount_data(&uri);
+        // Saving is the point at which the user expects the world to be
+        // consistent, and `ensure_beancount_data` only fills in *missing*
+        // data — stale data from before the last edits would survive it.
+        state.schedule_extraction(&uri);
         refresh_include_graph(state, &uri);
     }
 
