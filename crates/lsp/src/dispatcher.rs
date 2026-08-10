@@ -175,7 +175,10 @@ impl<'a> NotificationDispatcher<'a> {
         let params = match notification.extract::<N::Params>(N::METHOD.as_str()) {
             Ok(it) => it,
             Err(lsp_server::ExtractError::JsonError { method, error }) => {
-                panic!("Invalid request\nMethod: {method}\n error: {error}",)
+                // A malformed notification from the client must not take the
+                // whole server down: this runs on the main loop.
+                tracing::error!("Invalid notification\nMethod: {method}\n error: {error}");
+                return Ok(self);
             }
             Err(lsp_server::ExtractError::MethodMismatch(notification)) => {
                 self.notification = Some(notification);
