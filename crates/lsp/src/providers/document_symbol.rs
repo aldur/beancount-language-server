@@ -41,7 +41,7 @@ pub(crate) fn document_symbols(
     let mut cursor = root_node.walk();
 
     for child in root_node.children(&mut cursor) {
-        if let Some(symbol) = extract_symbol(&child, &content) {
+        if let Some(symbol) = extract_symbol(&child, &content, 0) {
             symbols.push(symbol);
         }
     }
@@ -51,7 +51,11 @@ pub(crate) fn document_symbols(
 }
 
 /// Extract a DocumentSymbol from a tree-sitter node.
-fn extract_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
+fn extract_symbol(node: &Node, content: &Rope, depth: usize) -> Option<DocumentSymbol> {
+    if depth > crate::treesitter_utils::MAX_TREE_DEPTH {
+        tracing::warn!("document symbols: tree deeper than the walk limit, truncating");
+        return None;
+    }
     match node.kind() {
         "transaction" => extract_transaction_symbol(node, content),
         "open" => extract_open_symbol(node, content),
@@ -62,7 +66,7 @@ fn extract_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
         "event" => extract_event_symbol(node, content),
         "option" => extract_option_symbol(node, content),
         "comment" => extract_heading_symbol(node, content),
-        "section" => extract_section_symbol(node, content),
+        "section" => extract_section_symbol(node, content, depth),
         _ => None,
     }
 }
@@ -398,7 +402,11 @@ fn extract_option_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> 
 /// Extract section symbol (org-mode and markdown sections parsed by tree-sitter-beancount).
 /// Sections are hierarchical with "headline" and nested "section" children.
 /// Supports both org-mode (* headers) and markdown (# headers).
-fn extract_section_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol> {
+fn extract_section_symbol(node: &Node, content: &Rope, depth: usize) -> Option<DocumentSymbol> {
+    if depth > crate::treesitter_utils::MAX_TREE_DEPTH {
+        tracing::warn!("document symbols: sections nested deeper than the walk limit, truncating");
+        return None;
+    }
     let mut cursor = node.walk();
     let mut headline_text = String::new();
     let mut level = 0;
@@ -430,13 +438,13 @@ fn extract_section_symbol(node: &Node, content: &Rope) -> Option<DocumentSymbol>
             }
             "section" => {
                 // Recursively extract nested sections as children
-                if let Some(child_symbol) = extract_section_symbol(&child, content) {
+                if let Some(child_symbol) = extract_section_symbol(&child, content, depth + 1) {
                     children.push(child_symbol);
                 }
             }
             _ => {
                 // Extract other directives (open, transaction, etc.) as children
-                if let Some(child_symbol) = extract_symbol(&child, content) {
+                if let Some(child_symbol) = extract_symbol(&child, content, depth + 1) {
                     children.push(child_symbol);
                 }
             }

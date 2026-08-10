@@ -1,5 +1,13 @@
 use tree_sitter_beancount::tree_sitter;
 
+/// Maximum tree depth the recursive walkers will descend.
+///
+/// Real ledgers nest a handful of levels; pathological input does not.
+/// `1+1+1+…` a hundred thousand times parses into an equally deep
+/// expression tree, and a recursive walk over it overflows the stack —
+/// which aborts the whole process, on any thread, uncatchably.
+pub(crate) const MAX_TREE_DEPTH: usize = 256;
+
 /// Parse a beancount document from scratch.
 /// Returns `None` only if tree-sitter itself fails (extremely rare).
 pub(crate) fn parse_beancount(text: &str) -> Option<tree_sitter::Tree> {

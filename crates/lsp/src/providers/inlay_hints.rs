@@ -242,7 +242,7 @@ fn extract_amount(
         match child.kind() {
             "incomplete_amount" | "amount" if amount_opt.is_none() => {
                 // First amount is the posting amount - parse it from structure
-                amount_opt = extract_amount_from_node(&child, content);
+                amount_opt = extract_amount_from_node(&child, content, 0);
             }
             "at" => {
                 // @ means unit price
@@ -254,7 +254,7 @@ fn extract_amount(
             }
             "price_annotation" => {
                 // Parse the price amount from price_annotation
-                price_amount_opt = extract_price_annotation(&child, content);
+                price_amount_opt = extract_price_annotation(&child, content, 0);
             }
             "cost_spec" => {
                 // Parse cost basis from cost_spec
@@ -278,7 +278,12 @@ fn extract_amount(
 fn extract_amount_from_node(
     amount_node: &tree_sitter::Node,
     content: &ropey::Rope,
+    depth: usize,
 ) -> Option<Amount> {
+    if depth > crate::treesitter_utils::MAX_TREE_DEPTH {
+        tracing::warn!("inlay hints: amount nested deeper than the walk limit, skipping");
+        return None;
+    }
     let mut cursor = amount_node.walk();
     let mut number_str = String::new();
     let mut currency_str = String::new();
@@ -322,12 +327,13 @@ fn extract_amount_from_node(
 fn extract_price_annotation(
     price_annotation_node: &tree_sitter::Node,
     content: &ropey::Rope,
+    depth: usize,
 ) -> Option<Amount> {
     let mut cursor = price_annotation_node.walk();
 
     for child in price_annotation_node.children(&mut cursor) {
         if child.kind() == "incomplete_amount" || child.kind() == "amount" {
-            return extract_amount_from_node(&child, content);
+            return extract_amount_from_node(&child, content, depth + 1);
         }
     }
 

@@ -86,7 +86,7 @@ pub(crate) fn semantic_tokens_full(
     let content: Rope = doc.content.clone();
 
     let mut raw_tokens = Vec::new();
-    collect_tokens(&tree.root_node(), &content, &mut raw_tokens);
+    collect_tokens(&tree.root_node(), &content, &mut raw_tokens, 0);
 
     if raw_tokens.is_empty() {
         return Ok(Some(SemanticTokens {
@@ -134,7 +134,11 @@ pub(crate) fn semantic_tokens_full(
     }))
 }
 
-fn collect_tokens(node: &Node, content: &Rope, out: &mut Vec<RawToken>) {
+fn collect_tokens(node: &Node, content: &Rope, out: &mut Vec<RawToken>, depth: usize) {
+    if depth > crate::treesitter_utils::MAX_TREE_DEPTH {
+        tracing::warn!("semantic tokens: tree deeper than the walk limit, truncating");
+        return;
+    }
     let child = match NodeKind::from(node.kind()) {
         NodeKind::Include
         | NodeKind::Pushtag
@@ -169,7 +173,7 @@ fn collect_tokens(node: &Node, content: &Rope, out: &mut Vec<RawToken>) {
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_tokens(&child, content, out);
+        collect_tokens(&child, content, out, depth + 1);
     }
 }
 
@@ -294,6 +298,26 @@ mod tests {
                 "token_type must equal legend entry built from token_types()"
             );
         }
+    }
+
+    #[test]
+    fn test_deeply_nested_input_does_not_overflow_the_stack() {
+        // `1+1+1+…` parses into an equally deep expression tree. Recursing
+        // over it overflowed the stack, which aborts the process — on any
+        // thread, uncatchably. The walk must bail out at its depth limit.
+        let content = format!(
+            "2020-01-01 * \"x\"\n  Assets:A {}1 USD\n  Assets:B\n",
+            "1+".repeat(100_000)
+        );
+        let rope = Rope::from_str(&content);
+        let mut parser = tree_sitter_beancount::tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_beancount::language())
+            .unwrap();
+        let tree = parser.parse(&content, None).unwrap();
+
+        let mut out = Vec::new();
+        collect_tokens(&tree.root_node(), &rope, &mut out, 0);
     }
 
     #[test]
@@ -430,7 +454,7 @@ mod tests {
             .unwrap();
 
         let mut tokens = Vec::new();
-        collect_tokens(&tree.root_node(), &content, &mut tokens);
+        collect_tokens(&tree.root_node(), &content, &mut tokens, 0);
 
         // Should collect at least the date token
         assert!(!tokens.is_empty());
@@ -456,7 +480,7 @@ mod tests {
             .unwrap();
 
         let mut tokens = Vec::new();
-        collect_tokens(&tree.root_node(), &content, &mut tokens);
+        collect_tokens(&tree.root_node(), &content, &mut tokens, 0);
 
         // Should collect multiple tokens: date, payee, narration, numbers, currency
         assert!(tokens.len() >= 4, "Should collect at least 4 tokens");
@@ -496,7 +520,7 @@ mod tests {
             .unwrap();
 
         let mut tokens = Vec::new();
-        collect_tokens(&tree.root_node(), &content, &mut tokens);
+        collect_tokens(&tree.root_node(), &content, &mut tokens, 0);
 
         // Should have both comment and date tokens
         let has_comment = tokens
