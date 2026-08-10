@@ -4,11 +4,9 @@ use crate::server::LspServerState;
 use crate::server::LspServerStateSnapshot;
 use crate::server::ProgressMsg;
 use crate::server::Task;
-use crate::to_json;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use crossbeam_channel::Sender;
-use lsp_types::Notification;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -98,23 +96,9 @@ fn refresh_include_graph(state: &mut LspServerState, changed: &PathBuf) {
     };
     for pruned in state.doc_store.retain_reachable(&root) {
         // Clear the client's now-orphaned markers for the dropped file.
-        let Ok(url) = url::Url::from_file_path(&pruned) else {
-            continue;
-        };
-        let Ok(uri) = lsp_types::Uri::from_str(url.as_str()) else {
-            continue;
-        };
-        let Ok(params) = to_json(lsp_types::PublishDiagnosticsParams {
-            uri,
-            diagnostics: Vec::new(),
-            version: None,
-        }) else {
-            continue;
-        };
-        let _ = state.task_sender.send(Task::Notify(lsp_server::Notification {
-            method: lsp_types::PublishDiagnosticsNotification::METHOD.to_string(),
-            params,
-        }));
+        if state.published_diagnostics.remove(&pruned) {
+            send_diagnostics(state, &pruned, Vec::new());
+        }
     }
 }
 
@@ -372,84 +356,71 @@ fn handle_diagnostics(
         return Ok(());
     }
 
-    publish_diagnostics(diags, snapshot.forest.keys().cloned(), &sender)
-}
-
-fn publish_diagnostics(
-    diags: HashMap<PathBuf, Vec<lsp_types::Diagnostic>>,
-    forest_keys: impl Iterator<Item = PathBuf>,
-    sender: &Sender<Task>,
-) -> Result<()> {
+    // The main loop turns this into notifications: it knows which files
+    // currently carry diagnostics, so it can publish only what changed
+    // instead of one message per file in the forest.
     let mut normalized: HashMap<PathBuf, Vec<lsp_types::Diagnostic>> = HashMap::new();
     for (path, diagnostics) in diags {
-        let key = normalize_path_for_diagnostics(&path);
-        normalized.entry(key).or_default().extend(diagnostics);
+        normalized
+            .entry(normalize_path_for_diagnostics(&path))
+            .or_default()
+            .extend(diagnostics);
+    }
+    sender.send(Task::Diagnostics(normalized))?;
+    Ok(())
+}
+
+/// Publish a diagnostics run, clearing only files that had diagnostics before.
+///
+/// Publishing an empty list for every file in the forest on every run meant a
+/// notification per file per save — 243 messages for a 243-file ledger, all
+/// but a handful of them empty and unnecessary.
+pub(crate) fn publish_diagnostics(
+    state: &mut crate::server::LspServerState,
+    diags: HashMap<PathBuf, Vec<lsp_types::Diagnostic>>,
+) {
+    let mut now_showing = HashSet::new();
+    for (file, diagnostics) in &diags {
+        if diagnostics.is_empty() {
+            continue;
+        }
+        now_showing.insert(file.clone());
+        send_diagnostics(state, file, diagnostics.clone());
     }
 
-    for file in forest_keys {
-        let lookup = normalize_path_for_diagnostics(&file);
-        let diagnostics = normalized.remove(&lookup).unwrap_or_default();
-        sender
-            .send(Task::Notify(lsp_server::Notification {
-                method: lsp_types::PublishDiagnosticsNotification::METHOD.to_string(),
-                params: to_json(lsp_types::PublishDiagnosticsParams {
-                    uri: {
-                        let url = url::Url::from_file_path(&file).map_err(|()| {
-                            anyhow!("Failed to convert file path to URI: {}", file.display())
-                        })?;
-                        lsp_types::Uri::from_str(url.as_str())
-                            .with_context(|| format!("Failed to parse URL as LSP URI: {}", url))?
-                    },
-                    diagnostics,
-                    version: None,
-                })
-                .unwrap(),
-            }))
-            .unwrap()
+    // Files that had diagnostics and no longer do need an explicit clear.
+    let stale: Vec<PathBuf> = state
+        .published_diagnostics
+        .difference(&now_showing)
+        .cloned()
+        .collect();
+    for file in stale {
+        send_diagnostics(state, &file, Vec::new());
     }
+    state.published_diagnostics = now_showing;
+}
 
-    // ignore the broken file paths
-    for (file, diagnostics) in normalized {
-        let url = match url::Url::from_file_path(&file) {
-            Ok(url) => url,
-            Err(_) => {
-                warn!("Failed to convert file path to URI: {}", file.display());
-                continue;
-            }
-        };
-
-        let uri = match lsp_types::Uri::from_str(url.as_str()) {
-            Ok(uri) => uri,
-            Err(e) => {
-                warn!("Failed to parse URL as LSP URI ({}): {}", url, e);
-                continue;
-            }
-        };
-
-        let params = match to_json(lsp_types::PublishDiagnosticsParams {
+/// Send one `publishDiagnostics`, or log why it could not be addressed.
+pub(crate) fn send_diagnostics(
+    state: &mut crate::server::LspServerState,
+    file: &Path,
+    diagnostics: Vec<lsp_types::Diagnostic>,
+) {
+    let Ok(url) = url::Url::from_file_path(file) else {
+        warn!("Failed to convert file path to URI: {}", file.display());
+        return;
+    };
+    let Ok(uri) = lsp_types::Uri::from_str(url.as_str()) else {
+        warn!("Failed to parse URL as LSP URI: {url}");
+        return;
+    };
+    state.send_notification::<lsp_types::PublishDiagnosticsNotification>(
+        lsp_types::PublishDiagnosticsParams {
             uri,
             diagnostics,
             version: None,
-        }) {
-            Ok(params) => params,
-            Err(e) => {
-                warn!(
-                    "Failed to serialize diagnostics for {}: {}",
-                    file.display(),
-                    e
-                );
-                continue;
-            }
-        };
-
-        if let Err(e) = sender.send(Task::Notify(lsp_server::Notification {
-            method: lsp_types::PublishDiagnosticsNotification::METHOD.to_string(),
-            params,
-        })) {
-            return Err(e.into());
-        }
-    }
-    Ok(())
+        },
+    );
 }
 
 fn normalize_path_for_diagnostics(path: &Path) -> PathBuf {

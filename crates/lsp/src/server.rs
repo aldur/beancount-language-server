@@ -59,7 +59,6 @@ pub(crate) enum ProgressMsg {
 #[derive(Debug)]
 pub(crate) enum Task {
     Response(lsp_server::Response),
-    Notify(lsp_server::Notification),
     Progress(ProgressMsg),
     /// A document parsed on the thread pool.
     Parsed {
@@ -67,6 +66,8 @@ pub(crate) enum Task {
         version: i32,
         tree: Option<Arc<tree_sitter::Tree>>,
     },
+    /// A completed diagnostics run, to be diffed against what is displayed.
+    Diagnostics(HashMap<PathBuf, Vec<lsp_types::Diagnostic>>),
     /// Semantic data rebuilt on the thread pool after an edit.
     SemanticData {
         path: PathBuf,
@@ -128,6 +129,10 @@ pub(crate) struct LspServerState {
 
     /// Files with a parse in flight, for the same reason as `extracting`.
     pub parsing: std::collections::HashSet<PathBuf>,
+
+    /// Files that currently show diagnostics in the client, so a run can
+    /// clear exactly those that no longer have any.
+    pub published_diagnostics: std::collections::HashSet<PathBuf>,
 
     // Cached checker instance (created once and reused)
     pub checker_registry: CheckerRegistry,
@@ -198,6 +203,7 @@ impl LspServerState {
             thread_pool: threadpool::ThreadPool::default(),
             extracting: std::collections::HashSet::new(),
             parsing: std::collections::HashSet::new(),
+            published_diagnostics: std::collections::HashSet::new(),
             checker_registry: CheckerRegistry::new(),
             request_router,
         }
@@ -314,10 +320,6 @@ impl LspServerState {
     // Handles a task sent by another async task
     fn handle_task(&mut self, task: Task) -> anyhow::Result<()> {
         match task {
-            Task::Notify(notification) => {
-                tracing::debug!("Sending notification: {}", notification.method);
-                self.send(notification.into());
-            }
             Task::Response(response) => {
                 tracing::debug!("Sending response for request: {}", response.id);
                 self.respond(response);
@@ -325,6 +327,9 @@ impl LspServerState {
             Task::Progress(progress_task) => {
                 tracing::debug!("Handling progress task: {:?}", progress_task);
                 self.handle_progress_task(progress_task)?;
+            }
+            Task::Diagnostics(diags) => {
+                text_document::publish_diagnostics(self, diags);
             }
             Task::Parsed {
                 path,

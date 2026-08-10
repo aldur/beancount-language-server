@@ -492,9 +492,6 @@ impl DocumentStore {
         self.open_docs.keys()
     }
 
-    pub(crate) fn forest_keys(&self) -> impl Iterator<Item = &PathBuf> {
-        self.forest.keys()
-    }
 
     // ── Snapshot ─────────────────────────────────────────────────────────────
 
