@@ -99,6 +99,10 @@ pub(crate) fn semantic_tokens_full(
         Ordering::Equal => a.start.cmp(&b.start),
         other => other,
     });
+    // The walk emits a transaction's flag twice (as the directive child and
+    // as its own node); overlapping tokens at one position render
+    // arbitrarily in clients that don't support them. Keep the first.
+    raw_tokens.dedup_by_key(|t| (t.line, t.start));
 
     let mut data = Vec::with_capacity(raw_tokens.len());
     let mut prev_line = 0u32;
