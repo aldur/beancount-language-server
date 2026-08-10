@@ -11,6 +11,7 @@ use lsp_types::Notification;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::str::FromStr;
 use tracing::{debug, warn};
 
@@ -301,6 +302,13 @@ pub(crate) fn did_change(
     state
         .doc_store
         .apply_change(&uri, &params.content_changes, params.text_document.version)?;
+
+    // Rebuild semantic data off the main loop: a full extraction pass over a
+    // large ledger takes hundreds of milliseconds, and doing it here (or
+    // lazily in `snapshot`, which every request calls) blocked the server on
+    // every keystroke.
+    state.schedule_extraction(&uri);
+
     debug!("text_document::did_change - done");
     Ok(())
 }

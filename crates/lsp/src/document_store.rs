@@ -287,7 +287,12 @@ impl DocumentStore {
             *Arc::make_mut(&mut self.forest)
                 .get_mut(uri)
                 .expect("tree should exist in forest") = Arc::new(tree);
-            Arc::make_mut(&mut self.beancount_data).remove(uri);
+            // The previous semantic data is kept deliberately: re-extracting
+            // it here (or lazily on the next request) costs a full pass over
+            // the document on the main loop, which for a large ledger is
+            // hundreds of milliseconds per keystroke. `did_change` schedules
+            // the rebuild on the thread pool instead, and completions use
+            // data that is at most one keystroke stale.
         } else {
             // Keep rope and tree from disagreeing: without a usable tree the
             // file leaves the forest until a later edit parses cleanly.
@@ -402,6 +407,37 @@ impl DocumentStore {
         pruned
     }
 
+    /// The tree, rope and version needed to rebuild semantic data off-thread.
+    pub(crate) fn extraction_inputs(
+        &self,
+        uri: &PathBuf,
+    ) -> Option<(Arc<tree_sitter::Tree>, Arc<Rope>, i32)> {
+        let tree = self.forest.get(uri)?.clone();
+        let doc = self.open_docs.get(uri)?;
+        Some((tree, Arc::new(doc.content.clone()), doc.version))
+    }
+
+    /// Install semantic data computed off-thread, unless the document moved on.
+    pub(crate) fn install_beancount_data(
+        &mut self,
+        uri: &PathBuf,
+        data: Arc<BeancountData>,
+        version: i32,
+    ) {
+        match self.open_docs.get(uri) {
+            Some(doc) if doc.version == version => {
+                Arc::make_mut(&mut self.beancount_data).insert(uri.clone(), data);
+            }
+            Some(doc) => tracing::trace!(
+                "Dropping semantic data for {:?}: built at v{}, document at v{}",
+                uri,
+                version,
+                doc.version
+            ),
+            None => {}
+        }
+    }
+
     /// Lazily extract `BeancountData` for `uri` if it is absent.
     ///
     /// Called before requests that need semantic data (completion, hover, …).
@@ -497,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_change_invalidates_beancount_data() {
+    fn test_apply_change_keeps_previous_semantic_data() {
         let mut store = DocumentStore::new();
         let uri = PathBuf::from("/test/file.beancount");
         store.open(uri.clone(), CONTENT, 1);
@@ -515,9 +551,10 @@ mod tests {
         );
         store.apply_change(&uri, &[change], 2).unwrap();
 
-        // beancount_data should be invalidated after change
-        assert!(!store.beancount_data.contains_key(&uri));
-        // but tree and doc should still be present
+        // Semantic data is deliberately kept (stale) rather than dropped:
+        // re-extracting per keystroke blocked the main loop. did_change
+        // schedules the rebuild on the thread pool.
+        assert!(store.beancount_data.contains_key(&uri));
         assert!(store.get_tree(&uri).is_some());
         assert!(store.open_docs.get(&uri).is_some());
     }
@@ -699,23 +736,33 @@ mod tests {
         let uri = PathBuf::from("/test/file.beancount");
         store.open(uri.clone(), CONTENT, 1);
 
-        // Simulate post-edit state: data absent, tree present
-        #[allow(deprecated)]
-        let change = lsp_types::TextDocumentContentChangeEvent::TextDocumentContentChangePartial(
-            lsp_types::TextDocumentContentChangePartial {
-                range: lsp_types::Range {
-                    start: lsp_types::Position::new(0, 0),
-                    end: lsp_types::Position::new(0, 0),
-                },
-                range_length: None,
-                text: "".to_string(),
-            },
-        );
-        store.apply_change(&uri, &[change], 2).unwrap();
+        // Data absent but tree present: the fallback must rebuild it.
+        Arc::make_mut(&mut store.beancount_data).remove(&uri);
         assert!(!store.beancount_data.contains_key(&uri));
 
         store.ensure_beancount_data(&uri);
         assert!(store.beancount_data.contains_key(&uri));
+    }
+
+    #[test]
+    fn test_install_beancount_data_respects_document_version() {
+        // Data built off-thread must not overwrite a newer document's data.
+        let mut store = DocumentStore::new();
+        let uri = PathBuf::from("/test/file.beancount");
+        store.open(uri.clone(), CONTENT, 1);
+        let (tree, rope, version) = store.extraction_inputs(&uri).unwrap();
+        assert_eq!(version, 1);
+        let fresh = Arc::new(BeancountData::new(&tree, &rope));
+
+        // Same version: installed.
+        store.install_beancount_data(&uri, fresh.clone(), 1);
+        assert!(Arc::ptr_eq(store.beancount_data.get(&uri).unwrap(), &fresh));
+
+        // Older version than the document: dropped.
+        store.open(uri.clone(), CONTENT, 5);
+        let current = store.beancount_data.get(&uri).unwrap().clone();
+        store.install_beancount_data(&uri, fresh.clone(), 1);
+        assert!(Arc::ptr_eq(store.beancount_data.get(&uri).unwrap(), &current));
     }
 
     #[test]

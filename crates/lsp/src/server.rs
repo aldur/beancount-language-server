@@ -61,6 +61,12 @@ pub(crate) enum Task {
     Response(lsp_server::Response),
     Notify(lsp_server::Notification),
     Progress(ProgressMsg),
+    /// Semantic data rebuilt on the thread pool after an edit.
+    SemanticData {
+        path: PathBuf,
+        version: i32,
+        data: Arc<BeancountData>,
+    },
 }
 
 #[derive(Debug)]
@@ -107,6 +113,12 @@ pub(crate) struct LspServerState {
 
     // Thread pool for async execution
     pub thread_pool: threadpool::ThreadPool,
+
+    /// Files with a semantic-data rebuild in flight. Rebuilding a large
+    /// ledger takes a while, so fast typing must not queue one extraction per
+    /// keystroke: at most one runs per file, and it re-checks the document
+    /// version when it lands.
+    pub extracting: std::collections::HashSet<PathBuf>,
 
     // Cached checker instance (created once and reused)
     pub checker_registry: CheckerRegistry,
@@ -175,6 +187,7 @@ impl LspServerState {
             published_diag_run: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             task_receiver,
             thread_pool: threadpool::ThreadPool::default(),
+            extracting: std::collections::HashSet::new(),
             checker_registry: CheckerRegistry::new(),
             request_router,
         }
@@ -302,6 +315,23 @@ impl LspServerState {
             Task::Progress(progress_task) => {
                 tracing::debug!("Handling progress task: {:?}", progress_task);
                 self.handle_progress_task(progress_task)?;
+            }
+            Task::SemanticData {
+                path,
+                version,
+                data,
+            } => {
+                self.extracting.remove(&path);
+                self.doc_store.install_beancount_data(&path, data, version);
+                // The document moved on while this was being built: coalesce
+                // all those edits into one fresh rebuild.
+                if self
+                    .doc_store
+                    .extraction_inputs(&path)
+                    .is_some_and(|(_, _, current)| current != version)
+                {
+                    self.schedule_extraction(&path);
+                }
             }
         }
         Ok(())
@@ -497,6 +527,30 @@ impl LspServerState {
     pub(crate) fn send_notification<N: lsp_types::Notification>(&mut self, params: N::Params) {
         let not = lsp_server::Notification::new(N::METHOD.to_string(), params);
         self.send(not.into());
+    }
+
+    /// Rebuild a file's semantic data on the thread pool, at most one at a
+    /// time per file.
+    pub(crate) fn schedule_extraction(&mut self, uri: &PathBuf) {
+        if self.extracting.contains(uri) {
+            return;
+        }
+        let Some((tree, rope, version)) = self.doc_store.extraction_inputs(uri) else {
+            return;
+        };
+        self.extracting.insert(uri.clone());
+        let sender = self.task_sender.clone();
+        let path = uri.clone();
+        self.thread_pool.execute(move || {
+            let data = Arc::new(BeancountData::new(&tree, &rope));
+            if let Err(e) = sender.send(Task::SemanticData {
+                path,
+                version,
+                data,
+            }) {
+                tracing::debug!("Failed to deliver semantic data: {e}");
+            }
+        });
     }
 
     pub(crate) fn snapshot(&mut self) -> LspServerStateSnapshot {

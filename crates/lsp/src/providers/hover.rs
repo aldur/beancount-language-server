@@ -38,22 +38,30 @@ pub(crate) fn hover(
 
     let posting_hint = find_posting_inlay_hint(&content, node);
 
+    // The account is optional: hovering a posting's *amount* has no account
+    // ancestor, and bailing out there threw away the posting hint that was
+    // just computed — the whole reason hover reaches into inlay hints.
     let account_node = find_node_of_kind(node, NodeKind::Account);
-    let Some(account_node) = account_node else {
-        return Ok(None);
+    let notes = match &account_node {
+        Some(account_node) => {
+            let account_name = text_for_tree_sitter_node(&content, account_node);
+            let notes = collect_account_notes(&snapshot.beancount_data, &account_name);
+            Some((account_name, notes))
+        }
+        None => None,
     };
 
-    let account_name = text_for_tree_sitter_node(&content, &account_node);
-    let notes = collect_account_notes(&snapshot.beancount_data, &account_name);
-
-    if notes.is_empty() && posting_hint.is_none() {
+    let has_notes = notes.as_ref().is_some_and(|(_, notes)| !notes.is_empty());
+    if !has_notes && posting_hint.is_none() {
         return Ok(None);
     }
 
     let mut sections = Vec::new();
 
-    if !notes.is_empty() {
-        sections.push(format_account_hover_text(&account_name, &notes));
+    if let Some((account_name, notes)) = &notes
+        && !notes.is_empty()
+    {
+        sections.push(format_account_hover_text(account_name, notes));
     }
 
     if let Some(label) = posting_hint {
@@ -61,7 +69,9 @@ pub(crate) fn hover(
     }
 
     let hover_text = sections.join("\n\n");
-    let range = tree_sitter_node_to_lsp_range(&content, &account_node);
+    // Highlight the account when there is one, otherwise the node under the
+    // cursor.
+    let range = tree_sitter_node_to_lsp_range(&content, account_node.as_ref().unwrap_or(&node));
 
     Ok(Some(Hover {
         contents: Contents::MarkupContent(MarkupContent {
