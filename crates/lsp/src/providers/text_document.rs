@@ -98,6 +98,49 @@ pub(crate) fn did_open(
 }
 
 
+/// Re-derive the include graph after a file's content changed: pick up newly
+/// included files, drop the ones no longer reachable from the journal root,
+/// and clear the client's diagnostics for whatever was dropped.
+///
+/// Includes are only scanned on didOpen otherwise, which freezes the graph
+/// at open: an `include` line added later was never picked up, and a removed
+/// one kept feeding completions and diagnostics forever.
+fn refresh_include_graph(state: &mut LspServerState, changed: &PathBuf) {
+    let mut processed = HashSet::new();
+    if let Err(e) = process_includes(state, changed, &mut processed) {
+        debug!("Error processing includes for {:?}: {}", changed, e);
+    }
+
+    let Some(root) = state.config.journal_root.clone() else {
+        return;
+    };
+    let root = if root.is_relative() {
+        state.config.root_dir.join(root)
+    } else {
+        root
+    };
+    for pruned in state.doc_store.retain_reachable(&root) {
+        // Clear the client's now-orphaned markers for the dropped file.
+        let Ok(url) = url::Url::from_file_path(&pruned) else {
+            continue;
+        };
+        let Ok(uri) = lsp_types::Uri::from_str(url.as_str()) else {
+            continue;
+        };
+        let Ok(params) = to_json(lsp_types::PublishDiagnosticsParams {
+            uri,
+            diagnostics: Vec::new(),
+            version: None,
+        }) else {
+            continue;
+        };
+        let _ = state.task_sender.send(Task::Notify(lsp_server::Notification {
+            method: lsp_types::PublishDiagnosticsNotification::METHOD.to_string(),
+            params,
+        }));
+    }
+}
+
 /// Provider function for `textDocument/didSave`.
 pub(crate) fn did_save(
     state: &mut LspServerState,
@@ -107,6 +150,7 @@ pub(crate) fn did_save(
 
     if let Ok(uri) = params.text_document.uri.to_file_path() {
         state.doc_store.ensure_beancount_data(&uri);
+        refresh_include_graph(state, &uri);
     }
 
     let snapshot = state.snapshot();
@@ -184,6 +228,7 @@ pub(crate) fn did_change_watched_files(
                 {
                     state.doc_store.insert_parsed(uri.clone(), tree, &content);
                     tracing::debug!("Re-parsed external file: {:?}", uri);
+                    refresh_include_graph(state, &uri);
                 }
             }
             lsp_types::FileChangeType::Deleted => {

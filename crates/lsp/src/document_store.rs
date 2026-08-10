@@ -309,6 +309,47 @@ impl DocumentStore {
         // open_docs and parsers untouched — file is not open in the editor
     }
 
+    /// Drop forest entries that are neither open nor reachable from `root`
+    /// via include directives. Returns the pruned paths.
+    ///
+    /// The include graph changes with every edit of a journal; without
+    /// pruning the forest is add-only, and a file whose include line was
+    /// removed keeps feeding completions, references and diagnostics
+    /// forever.
+    pub(crate) fn retain_reachable(&mut self, root: &std::path::Path) -> Vec<PathBuf> {
+        let mut keep: std::collections::HashSet<PathBuf> =
+            self.open_docs.keys().cloned().collect();
+        keep.insert(root.to_path_buf());
+        let mut queue: Vec<PathBuf> = keep.iter().cloned().collect();
+        while let Some(path) = queue.pop() {
+            let Some(tree) = self.forest.get(&path) else {
+                continue;
+            };
+            let Some(text) = self.get_content(&path) else {
+                continue;
+            };
+            for include in crate::forest::extract_include_paths(tree, text.as_bytes(), &path) {
+                if keep.insert(include.clone()) {
+                    queue.push(include);
+                }
+            }
+        }
+
+        let pruned: Vec<PathBuf> = self
+            .forest
+            .keys()
+            .filter(|path| !keep.contains(*path))
+            .cloned()
+            .collect();
+        for path in &pruned {
+            Arc::make_mut(&mut self.forest).remove(path);
+            Arc::make_mut(&mut self.beancount_data).remove(path);
+            Arc::make_mut(&mut self.forest_content).remove(path);
+            self.parsers.remove(path);
+        }
+        pruned
+    }
+
     /// Lazily extract `BeancountData` for `uri` if it is absent.
     ///
     /// Called before requests that need semantic data (completion, hover, …).
@@ -712,6 +753,51 @@ mod tests {
 
         assert!(store.get_tree(&uri).is_none());
         assert!(!store.beancount_data.contains_key(&uri));
+    }
+
+    #[test]
+    fn test_retain_reachable_prunes_unincluded_files() {
+        // Files dropped from the include graph must leave the forest, or
+        // they keep feeding completions and diagnostics forever.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("main.beancount");
+        let kept = dir.path().join("kept.beancount");
+        let ghost = dir.path().join("ghost.beancount");
+        std::fs::write(&root, "include \"kept.beancount\"\n").unwrap();
+        std::fs::write(&kept, "2020-01-01 open Assets:Kept\n").unwrap();
+        std::fs::write(&ghost, "2020-01-01 open Assets:Ghost\n").unwrap();
+
+        let mut store = DocumentStore::new();
+        for path in [&root, &kept, &ghost] {
+            let content = std::fs::read_to_string(path).unwrap();
+            store.insert_parsed(path.clone(), parse(&content), &content);
+        }
+
+        let pruned = store.retain_reachable(&root);
+
+        assert_eq!(pruned, vec![ghost.clone()]);
+        assert!(store.get_tree(&ghost).is_none());
+        assert!(store.get_tree(&kept).is_some());
+        assert!(store.get_tree(&root).is_some());
+    }
+
+    #[test]
+    fn test_retain_reachable_keeps_open_docs() {
+        // An open buffer stays even when unreachable from the journal.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("main.beancount");
+        let open_file = dir.path().join("scratch.beancount");
+        std::fs::write(&root, "2020-01-01 open Assets:Root\n").unwrap();
+
+        let mut store = DocumentStore::new();
+        let content = std::fs::read_to_string(&root).unwrap();
+        store.insert_parsed(root.clone(), parse(&content), &content);
+        store.open(open_file.clone(), "2020-01-01 open Assets:Open\n", 1);
+
+        let pruned = store.retain_reachable(&root);
+
+        assert!(pruned.is_empty());
+        assert!(store.get_tree(&open_file).is_some());
     }
 
     #[test]
