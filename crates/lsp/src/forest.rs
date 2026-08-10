@@ -233,9 +233,14 @@ pub(crate) fn parse_initial_forest(
 
         // Always send data for the parsed file (server needs it)
         // But we could batch progress updates in the future if needed
+        //
+        // `total` still excludes whatever this file includes, so it can equal
+        // `processed` here — and the client maps done == total to End. Keep
+        // the reported total ahead of done so mid-init messages stay Reports;
+        // the message after the loop is the single End.
         if let Err(e) = sender.send(Task::Progress(ProgressMsg::ForestInit {
             done: processed,
-            total,
+            total: total.max(processed + 1),
             data: Box::new(Some((
                 file.clone(),
                 tree_arc.clone(),
@@ -740,15 +745,21 @@ include "{}"
         // Verify progress tracking is correct
         let mut max_total = 0;
         let mut max_done = 0;
+        let mut final_done_total = None;
         while let Ok(task) = receiver.try_recv() {
             if let Task::Progress(ProgressMsg::ForestInit { done, total, .. }) = task {
                 max_total = max_total.max(total);
                 max_done = max_done.max(done);
+                final_done_total = Some((done, total));
             }
         }
 
-        assert_eq!(max_total, 3); // main + file1 + file2
+        // Mid-init messages keep `total` ahead of `done` so the client does
+        // not see an End before the last file (hence 4, not 3); the final
+        // message reports the true 3/3.
+        assert_eq!(max_total, 4);
         assert_eq!(max_done, 3); // All files processed
+        assert_eq!(final_done_total, Some((3, 3)));
     }
 
     #[test]

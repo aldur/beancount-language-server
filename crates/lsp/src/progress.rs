@@ -8,10 +8,13 @@ pub(crate) enum Progress {
 }
 
 impl Progress {
-    /// Builds a fractional progress value
+    /// Builds a fractional progress value, clamped to 0.0..=1.0.
+    ///
+    /// Clamped rather than asserted: this runs on the main loop, so a
+    /// background sender that miscounts would otherwise kill the server over
+    /// a cosmetic progress value.
     pub(crate) fn fraction(done: usize, total: usize) -> f64 {
-        assert!(done <= total);
-        done as f64 / total.max(1) as f64
+        (done as f64 / total.max(1) as f64).clamp(0.0, 1.0)
     }
 }
 
@@ -27,10 +30,10 @@ impl LspServerState {
     ) {
         // TODO: Ensure that the client supports WorkDoneProgress
 
-        let percentage = fraction.map(|f| {
-            (0.0..=1.0).contains(&f);
-            (f * 100.0) as u32
-        });
+        // The clamp matters: `as u32` saturates a negative fraction to 0 and
+        // a >1 fraction to a nonsense percentage. (The previous
+        // `(0.0..=1.0).contains(&f);` computed a bool and discarded it.)
+        let percentage = fraction.map(|f| (f.clamp(0.0, 1.0) * 100.0) as u32);
         let token_label = match token_suffix {
             Some(suffix) => format!("beancount/{title}{suffix}"),
             None => format!("beancount/{title}"),
@@ -151,10 +154,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "assertion failed")]
-    fn test_progress_fraction_invalid_done_greater_than_total() {
-        // Should panic when done > total
-        Progress::fraction(11, 10);
+    fn test_progress_fraction_clamps_instead_of_panicking() {
+        // This runs on the main loop: a miscounting sender must not be able
+        // to kill the server over a progress value.
+        assert_eq!(Progress::fraction(11, 10), 1.0);
+        assert_eq!(Progress::fraction(0, 0), 0.0);
     }
 
     #[test]
