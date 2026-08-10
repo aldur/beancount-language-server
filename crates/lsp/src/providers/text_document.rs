@@ -198,8 +198,17 @@ pub(crate) fn did_change_watched_files(
                 }
             }
             lsp_types::FileChangeType::Deleted => {
-                tracing::debug!("External file deleted: {:?}", uri);
-                state.doc_store.remove_external(&uri);
+                // Only if the editor is not holding it: a buffer whose file was
+                // deleted (git checkout, stash, rebase) is still open and still
+                // the source of truth, and dropping its tree, semantic data and
+                // parser killed every feature in that window. The Created and
+                // Changed branches above already skip open documents.
+                if state.doc_store.has_open_doc(&uri) {
+                    tracing::debug!("Deleted {:?} is open in the editor, keeping its state", uri);
+                } else {
+                    tracing::debug!("External file deleted: {:?}", uri);
+                    state.doc_store.remove_external(&uri);
+                }
             }
         }
     }
