@@ -94,6 +94,13 @@ pub(crate) struct LspServerState {
 
     // Channel to send tasks to from background operations
     pub task_sender: Sender<Task>,
+    /// Monotone id for diagnostics runs, assigned on the main loop so it
+    /// follows event order; see `published_diag_run`.
+    pub next_diag_run: u64,
+    /// Highest diagnostics run published so far. Runs execute on the thread
+    /// pool and can finish out of order; a slower, earlier run must not
+    /// overwrite a newer run's results with stale ones.
+    pub published_diag_run: Arc<std::sync::atomic::AtomicU64>,
 
     // Channel to receive tasks on from background operations
     pub task_receiver: Receiver<Task>,
@@ -164,6 +171,8 @@ impl LspServerState {
             sender,
             shutdown_requested: false,
             task_sender,
+            next_diag_run: 0,
+            published_diag_run: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             task_receiver,
             thread_pool: threadpool::ThreadPool::default(),
             checker_registry: CheckerRegistry::new(),

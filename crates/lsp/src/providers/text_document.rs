@@ -86,12 +86,17 @@ pub(crate) fn did_open(
 
     let snapshot = state.snapshot();
     let task_sender = state.task_sender.clone();
+    state.next_diag_run += 1;
+    let run = state.next_diag_run;
+    let published = state.published_diag_run.clone();
     state.thread_pool.execute(move || {
-        let _result = handle_diagnostics(snapshot, task_sender, params.text_document.uri);
+        let _result =
+            handle_diagnostics(snapshot, task_sender, params.text_document.uri, run, published);
     });
 
     Ok(())
 }
+
 
 /// Provider function for `textDocument/didSave`.
 pub(crate) fn did_save(
@@ -106,8 +111,12 @@ pub(crate) fn did_save(
 
     let snapshot = state.snapshot();
     let task_sender = state.task_sender.clone();
+    state.next_diag_run += 1;
+    let run = state.next_diag_run;
+    let published = state.published_diag_run.clone();
     state.thread_pool.execute(move || {
-        let _result = handle_diagnostics(snapshot, task_sender, params.text_document.uri);
+        let _result =
+            handle_diagnostics(snapshot, task_sender, params.text_document.uri, run, published);
     });
 
     Ok(())
@@ -206,8 +215,11 @@ pub(crate) fn did_change_watched_files(
                 }
             };
 
+            state.next_diag_run += 1;
+            let run = state.next_diag_run;
+            let published = state.published_diag_run.clone();
             state.thread_pool.execute(move || {
-                let _result = handle_diagnostics(snapshot, task_sender, lsp_uri);
+                let _result = handle_diagnostics(snapshot, task_sender, lsp_uri, run, published);
             });
         } else {
             tracing::debug!(
@@ -252,6 +264,8 @@ fn handle_diagnostics(
     snapshot: LspServerStateSnapshot,
     sender: Sender<Task>,
     uri: lsp_types::Uri,
+    run: u64,
+    published: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<()> {
     tracing::debug!("text_document::handle_diagnostics");
 
@@ -287,21 +301,14 @@ fn handle_diagnostics(
         }
     };
 
-    // Generate a unique run id for this diagnostics execution to avoid
-    // progress token collisions if multiple runs overlap.
-    let run_id: u64 = {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
-    };
-
+    // `run` doubles as the progress-token suffix: assigned on the main loop,
+    // it is unique and monotone (the previous wall-clock id collided when two
+    // runs started within the same millisecond).
     sender.send(Task::Progress(ProgressMsg::BeanCheck {
         done: 0,
         total: 1,
         checker_name: checker.name().to_string(),
-        run_id,
+        run_id: run,
     }))?;
 
     let diags = diagnostics::diagnostics(
@@ -315,8 +322,16 @@ fn handle_diagnostics(
         done: 1,
         total: 1,
         checker_name: checker.name().to_string(),
-        run_id,
+        run_id: run,
     }))?;
+
+    // Runs execute concurrently on the pool and bean-check duration varies:
+    // an earlier run finishing late must not overwrite a newer run's
+    // results with stale diagnostics.
+    if published.fetch_max(run, std::sync::atomic::Ordering::SeqCst) > run {
+        tracing::debug!("diagnostics run {run} superseded, dropping its results");
+        return Ok(());
+    }
 
     publish_diagnostics(diags, snapshot.forest.keys().cloned(), &sender)
 }
@@ -690,7 +705,7 @@ mod tests {
         config.journal_root = None; // Explicitly set to None
 
         // Create a mock checker that succeeds
-        let checker = SystemCallChecker::new(PathBuf::from("/bin/true"));
+        let checker = SystemCallChecker::new(PathBuf::from("/bin/true"), std::time::Duration::from_secs(30));
 
         // Create snapshot
         let snapshot = LspServerStateSnapshot {
@@ -706,7 +721,13 @@ mod tests {
         let (sender, receiver) = crossbeam_channel::unbounded();
 
         // Call handle_diagnostics - this should NOT skip diagnostics
-        let result = handle_diagnostics(snapshot, sender, uri.clone());
+        let result = handle_diagnostics(
+            snapshot,
+            sender,
+            uri.clone(),
+            1,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        );
 
         // The function should succeed (not return error about missing journal_root)
         assert!(
@@ -757,7 +778,7 @@ mod tests {
         config.journal_root = Some(root_journal.clone());
 
         // Create a mock checker
-        let checker = SystemCallChecker::new(PathBuf::from("/bin/true"));
+        let checker = SystemCallChecker::new(PathBuf::from("/bin/true"), std::time::Duration::from_secs(30));
 
         // Create snapshot
         let snapshot = LspServerStateSnapshot {
@@ -773,7 +794,13 @@ mod tests {
         let (sender, receiver) = crossbeam_channel::unbounded();
 
         // Call handle_diagnostics with a different file than journal_root
-        let result = handle_diagnostics(snapshot, sender, uri.clone());
+        let result = handle_diagnostics(
+            snapshot,
+            sender,
+            uri.clone(),
+            1,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        );
 
         // Should succeed
         assert!(
@@ -826,7 +853,13 @@ mod tests {
         let (sender, _receiver) = crossbeam_channel::unbounded();
 
         // Should succeed but skip diagnostics
-        let result = handle_diagnostics(snapshot, sender, uri);
+        let result = handle_diagnostics(
+            snapshot,
+            sender,
+            uri,
+            1,
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        );
 
         assert!(result.is_ok(), "Should handle missing checker gracefully");
     }
