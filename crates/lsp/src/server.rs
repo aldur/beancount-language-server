@@ -556,8 +556,13 @@ impl LspServerState {
 
         let watch_kind = WatchKind::Create | WatchKind::Change | WatchKind::Delete;
 
+        // `include` directives are extension-agnostic, so the watcher must
+        // cover more than the two canonical extensions; `.include` is a
+        // common convention for ledger fragments. Files pulled in under yet
+        // other extensions still end up in the forest but go stale on
+        // external changes.
         let watchers = vec![FileSystemWatcher {
-            glob_pattern: GlobPattern::Pattern("**/*.{bean,beancount}".to_string()),
+            glob_pattern: GlobPattern::Pattern("**/*.{bean,beancount,include}".to_string()),
             kind: Some(watch_kind),
         }];
 
