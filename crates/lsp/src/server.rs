@@ -68,11 +68,13 @@ pub(crate) enum Task {
     },
     /// A completed diagnostics run, to be diffed against what is displayed.
     Diagnostics(HashMap<PathBuf, Vec<lsp_types::Diagnostic>>),
-    /// Semantic data rebuilt on the thread pool after an edit.
+    /// Semantic data rebuilt on the thread pool after an edit. `None` when the
+    /// rebuild failed, which still has to be delivered so the in-flight marker
+    /// is cleared.
     SemanticData {
         path: PathBuf,
         version: i32,
-        data: Arc<BeancountData>,
+        data: Option<Arc<BeancountData>>,
     },
 }
 
@@ -366,7 +368,10 @@ impl LspServerState {
                 data,
             } => {
                 self.extracting.remove(&path);
-                self.doc_store.install_beancount_data(&path, data, version);
+                match data {
+                    Some(data) => self.doc_store.install_beancount_data(&path, data, version),
+                    None => tracing::warn!("Semantic extraction for {:?} failed", path),
+                }
                 // The document moved on while this was being built: coalesce
                 // all those edits into one fresh rebuild.
                 if self
@@ -643,10 +648,14 @@ impl LspServerState {
         let sender = self.task_sender.clone();
         let path = uri.clone();
         self.thread_pool.execute(move || {
+            // Always deliver a result, even on a panic: the in-flight marker is
+            // cleared when this message arrives, so losing it would stop this
+            // file from ever being parsed again.
+            let tree = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // The depth check belongs here, next to the parse: a tree deeper
             // than the walkers will follow is worse than no tree, because
             // every query over it is unbounded work.
-            let tree = crate::treesitter_utils::parse_beancount(&text)
+            crate::treesitter_utils::parse_beancount(&text)
                 .filter(|tree| {
                     if crate::treesitter_utils::tree_depth_exceeds(
                         tree,
@@ -658,7 +667,12 @@ impl LspServerState {
                         true
                     }
                 })
-                .map(Arc::new);
+                .map(Arc::new)
+            }))
+            .unwrap_or_else(|_| {
+                tracing::error!("Parse task panicked");
+                None
+            });
             if let Err(e) = sender.send(Task::Parsed {
                 path,
                 version,
@@ -687,7 +701,12 @@ impl LspServerState {
         let sender = self.task_sender.clone();
         let path = uri.clone();
         self.thread_pool.execute(move || {
-            let data = Arc::new(BeancountData::new(&tree, &rope));
+            // As above: deliver even on a panic so the marker clears.
+            let data = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Arc::new(BeancountData::new(&tree, &rope))
+            }))
+            .map_err(|_| tracing::error!("Semantic extraction task panicked"))
+            .ok();
             if let Err(e) = sender.send(Task::SemanticData {
                 path,
                 version,
