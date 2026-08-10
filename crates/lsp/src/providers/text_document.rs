@@ -148,6 +148,9 @@ pub(crate) fn did_close(
         }
     };
     state.doc_store.close(&uri);
+    // The file stays in the forest, so refresh its semantic data off-thread
+    // rather than at close time.
+    state.schedule_extraction(&uri);
     Ok(())
 }
 

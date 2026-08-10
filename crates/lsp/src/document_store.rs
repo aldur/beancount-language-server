@@ -303,8 +303,11 @@ impl DocumentStore {
     /// (references, diagnostics). The rope is transferred to `forest_content` so
     /// providers can still access the file's text without falling back to disk.
     pub(crate) fn close(&mut self, uri: &PathBuf) {
-        // Ensure beancount_data is populated before losing the open_doc rope.
-        self.ensure_beancount_data(uri);
+        // Deliberately no extraction here: building semantic data for a 5.8MB
+        // buffer costs a quarter of a second on the main loop, and closing a
+        // file is not the moment to spend it. Whatever data exists stays (it is
+        // at most one keystroke stale) and the caller schedules a rebuild from
+        // the rope below.
 
         // Transfer rope to forest_content so it stays available after close.
         if let Some(doc) = self.open_docs.get(uri) {
@@ -739,6 +742,39 @@ mod tests {
         assert!(store.forest_content.contains_key(&uri));
         // Parser kept for reuse
         assert!(store.parsers.contains_key(&uri));
+    }
+
+    #[test]
+    fn test_close_keeps_state_without_extracting() {
+        // Closing must not rebuild semantic data: that is a full pass over the
+        // document on the main loop. Existing data stays and the tree and rope
+        // remain available for cross-file work.
+        let mut store = DocumentStore::new();
+        let uri = PathBuf::from("/test/file.beancount");
+        open_parsed(&mut store, &uri, CONTENT, 1);
+        let before = store.beancount_data.get(&uri).unwrap().clone();
+
+        store.close(&uri);
+
+        assert!(store.open_docs.get(&uri).is_none());
+        assert!(store.get_tree(&uri).is_some());
+        assert!(store.forest_content.contains_key(&uri));
+        assert!(Arc::ptr_eq(store.beancount_data.get(&uri).unwrap(), &before));
+    }
+
+    #[test]
+    fn test_close_without_data_leaves_it_absent_for_the_scheduler() {
+        let mut store = DocumentStore::new();
+        let uri = PathBuf::from("/test/file.beancount");
+        store.open(uri.clone(), CONTENT, 1);
+        assert!(store.install_tree(&uri, Arc::new(parse(CONTENT)), 1));
+
+        store.close(&uri);
+
+        // No synchronous extraction happened; the rope is cached so the
+        // scheduled rebuild can still run.
+        assert!(!store.beancount_data.contains_key(&uri));
+        assert!(store.extraction_inputs(&uri).is_some());
     }
 
     #[test]
