@@ -96,15 +96,13 @@ pub(crate) fn inlay_hints(
 
     let mut hints = Vec::new();
 
-    // Query for all transactions
-    let transaction_query =
-        tree_sitter::Query::new(&tree_sitter_beancount::language(), TRANSACTION_QUERY)
-            .context("Failed to compile transaction query")?;
+    // Compiled once, not per request (every other query goes through the cache).
+    let transaction_query = crate::query_cache::transaction_query(TRANSACTION_QUERY);
 
     let mut cursor = tree_sitter::QueryCursor::new();
     cursor.set_byte_range(0..content_bytes.len());
 
-    let mut matches = cursor.matches(&transaction_query, tree.root_node(), content_bytes);
+    let mut matches = cursor.matches(transaction_query, tree.root_node(), content_bytes);
 
     while let Some(qmatch) = matches.next() {
         for capture in qmatch.captures {

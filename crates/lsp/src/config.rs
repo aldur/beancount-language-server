@@ -85,9 +85,9 @@ impl Config {
         }
     }
     pub fn update(&mut self, json: serde_json::Value) -> Result<()> {
-        let result = serde_json::from_value::<BeancountLspOptions>(json.clone());
-
-        let beancount_lsp_settings = match result {
+        let beancount_lsp_settings = match serde_json::from_value::<BeancountLspOptions>(
+            json.clone(),
+        ) {
             Ok(c) => c,
             Err(err) => {
                 tracing::warn!(
@@ -95,7 +95,27 @@ impl Config {
                     json,
                     err,
                 );
-                return Ok(());
+                // Deserialisation is all-or-nothing, so one bad value (a
+                // number where a string belongs) would otherwise discard every
+                // valid option alongside it. Retry per top-level key and keep
+                // whatever parses, naming the ones that do not.
+                let Some(object) = json.as_object() else {
+                    return Ok(());
+                };
+                let mut salvaged = serde_json::Map::new();
+                for (key, value) in object {
+                    let candidate =
+                        serde_json::Value::Object([(key.clone(), value.clone())].into_iter().collect());
+                    if serde_json::from_value::<BeancountLspOptions>(candidate).is_ok() {
+                        salvaged.insert(key.clone(), value.clone());
+                    } else {
+                        tracing::warn!("Ignoring unusable option '{key}'");
+                    }
+                }
+                match serde_json::from_value::<BeancountLspOptions>(salvaged.into()) {
+                    Ok(c) => c,
+                    Err(_) => return Ok(()),
+                }
             }
         };
 
@@ -228,6 +248,23 @@ pub struct BeancountCheckOptions {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_update_salvages_valid_options_around_a_bad_one() {
+        // One unusable value must not discard the rest of the config.
+        let mut config = Config::new(PathBuf::from("/tmp"));
+        let json = serde_json::json!({
+            "journal_file": 5,                       // wrong type
+            "diagnostic_flags": ["!", "?"],          // valid
+            "bean_check": {"timeout_secs": 7},       // valid
+        });
+
+        config.update(json).unwrap();
+
+        assert_eq!(config.journal_root, None);
+        assert_eq!(config.diagnostic_flags, vec!["!".to_string(), "?".to_string()]);
+        assert_eq!(config.bean_check.timeout_secs, 7);
+    }
+
     use super::*;
 
     #[test]

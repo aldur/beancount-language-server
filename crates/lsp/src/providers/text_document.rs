@@ -338,11 +338,11 @@ fn handle_diagnostics(
         }
     };
 
-    tracing::debug!(
-        "Using checker: {}, available: {}",
-        checker.name(),
-        checker.is_available()
-    );
+    // Deliberately not calling is_available() here: for the Python checkers
+    // that spawns an interpreter (`import beancount`) on every single save,
+    // purely to fill in a debug log line. Availability was already
+    // established when the checker was discovered.
+    tracing::debug!("Using checker: {}", checker.name());
 
     let root_journal_path = match snapshot.config.journal_root.clone() {
         Some(path) => {

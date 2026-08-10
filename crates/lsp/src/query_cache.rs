@@ -97,14 +97,13 @@ pub(crate) fn account_query() -> &'static tree_sitter::Query {
 
 // ── forest query ──────────────────────────────────────────────────────────────
 
-static INCLUDE_QUERY: OnceLock<tree_sitter::Query> = OnceLock::new();
+static TRANSACTION_QUERY: OnceLock<tree_sitter::Query> = OnceLock::new();
 
-/// Include directives: extracts the string path argument.
-pub(crate) fn include_query() -> &'static tree_sitter::Query {
-    INCLUDE_QUERY.get_or_init(|| {
-        let q = r#"(include (string) @string)"#;
-        tree_sitter::Query::new(&tree_sitter_beancount::language(), q)
-            .expect("Failed to compile include query")
+/// Transactions, for inlay hints.
+pub(crate) fn transaction_query(source: &str) -> &'static tree_sitter::Query {
+    TRANSACTION_QUERY.get_or_init(|| {
+        tree_sitter::Query::new(&tree_sitter_beancount::language(), source)
+            .expect("Failed to compile transaction query")
     })
 }
 
@@ -168,7 +167,6 @@ mod tests {
         option_query();
         commodity_definition_query();
         account_query();
-        include_query();
         format_query();
     }
 
@@ -177,7 +175,6 @@ mod tests {
         assert!(std::ptr::eq(unified_query(), unified_query()));
         assert!(std::ptr::eq(currency_query(), currency_query()));
         assert!(std::ptr::eq(account_query(), account_query()));
-        assert!(std::ptr::eq(include_query(), include_query()));
         assert!(std::ptr::eq(format_query(), format_query()));
     }
 }
