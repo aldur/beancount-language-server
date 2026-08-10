@@ -283,6 +283,18 @@ pub(crate) fn did_change(
     Ok(())
 }
 
+/// Start a diagnostics run on the thread pool for `uri`.
+pub(crate) fn request_diagnostics(state: &mut LspServerState, uri: lsp_types::Uri) {
+    let snapshot = state.snapshot();
+    let task_sender = state.task_sender.clone();
+    state.next_diag_run += 1;
+    let run = state.next_diag_run;
+    let published = state.published_diag_run.clone();
+    state.thread_pool.execute(move || {
+        let _result = handle_diagnostics(snapshot, task_sender, uri, run, published);
+    });
+}
+
 fn handle_diagnostics(
     snapshot: LspServerStateSnapshot,
     sender: Sender<Task>,

@@ -490,6 +490,7 @@ impl LspServerState {
             .on::<lsp_types::DidChangeWatchedFilesNotification>(
                 text_document::did_change_watched_files,
             )?
+            .on::<lsp_types::DidChangeConfigurationNotification>(Self::did_change_configuration)?
             .on::<lsp_types::CancelNotification>(Self::cancel_request)?
             .finish();
         Ok(())
@@ -507,6 +508,38 @@ impl LspServerState {
         tracing::debug!("cancelling request {id}");
         if let Ok(mut cancelled) = self.cancelled.lock() {
             cancelled.insert(id);
+        }
+        Ok(())
+    }
+
+    /// Apply settings pushed after initialisation.
+    ///
+    /// Clients are free to deliver configuration this way instead of in
+    /// `initializationOptions`; this notification was unhandled, so for those
+    /// clients every setting was silently ignored. Some nest the options under
+    /// a section name, others send them bare — accept both.
+    fn did_change_configuration(
+        &mut self,
+        params: lsp_types::DidChangeConfigurationParams,
+    ) -> Result<()> {
+        let settings = match params.settings.get("beancount") {
+            Some(section) => section.clone(),
+            None => params.settings,
+        };
+        tracing::debug!("workspace/didChangeConfiguration: {settings:?}");
+        self.config.update(settings)?;
+
+        // bean_check settings may now point somewhere else, so discovery has
+        // to run again, and the new configuration should be reflected right
+        // away rather than at the next save.
+        self.checker_registry = CheckerRegistry::new();
+        self.ensure_checker();
+        let open = self.doc_store.open_doc_keys().next().cloned();
+        if let Some(uri) = open
+            && let Ok(url) = url::Url::from_file_path(&uri)
+            && let Ok(lsp_uri) = <lsp_types::Uri as std::str::FromStr>::from_str(url.as_str())
+        {
+            text_document::request_diagnostics(self, lsp_uri);
         }
         Ok(())
     }
