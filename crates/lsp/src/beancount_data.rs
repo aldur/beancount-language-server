@@ -867,7 +867,6 @@ mod bench {
         }
         eprintln!("  {} positions:  {:?}", text.len() / 7, t.elapsed());
         assert!(acc > 0);
-
         let t = Instant::now();
         let mut count = 0usize;
         let mut cursor = tree.walk();
