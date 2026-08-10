@@ -208,7 +208,15 @@ pub(crate) fn parse_initial_forest(
 
         processed += 1;
 
-        let text = read_file_cached(&file, &mut file_cache)?;
+        // One unreadable file (deleted since discovery, permissions) must not
+        // abort the whole initialisation and silently truncate the forest.
+        let text = match read_file_cached(&file, &mut file_cache) {
+            Ok(text) => text,
+            Err(e) => {
+                error!("Failed to read {:?}, skipping file: {}", file, e);
+                continue;
+            }
+        };
         let bytes = text.as_bytes();
 
         let tree = match crate::treesitter_utils::parse_beancount(&text) {
