@@ -486,6 +486,48 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_change_incremental_parse_matches_fresh_parse() {
+        // The InputEdits handed to tree-sitter must describe each change
+        // exactly (see lsp_textdocchange_to_ts_inputedit): wrong Points
+        // corrupt subtree reuse, yielding trees whose structure — and even
+        // byte ranges — diverge from a fresh parse of the same text.
+        let mut store = DocumentStore::new();
+        let uri = PathBuf::from("/test/file.beancount");
+        store.open(
+            uri.clone(),
+            "2024-01-02 * \"Café ☕\" \"Espresso\"\n  Expenses:Caffè  2.50 EUR\n  Assets:Bank:Checking\n",
+            1,
+        );
+
+        // A mix of edits that all previously produced corrupt Points:
+        // multi-line insert at EOF, replacement shrinking a span mid-doc,
+        // single-char append at the very end.
+        let edits = vec![
+            partial((3, 0), (3, 0), "2024-02-01 * \"New\"\n  Expenses:Food  1.00 EUR\n"),
+            partial((1, 2), (2, 2), "X"),
+            partial((3, 24), (3, 24), " ;🎉"),
+        ];
+        for (i, change) in edits.into_iter().enumerate() {
+            store.apply_change(&uri, &[change], i as i32 + 2).unwrap();
+        }
+
+        let text = store.open_docs.get(&uri).unwrap().text_string();
+        let incremental = store.get_tree(&uri).unwrap();
+        let fresh = parse(&text);
+        assert!(
+            incremental.root_node().end_byte() <= text.len(),
+            "incremental tree overruns the document: {} > {}",
+            incremental.root_node().end_byte(),
+            text.len()
+        );
+        assert_eq!(
+            incremental.root_node().to_sexp(),
+            fresh.root_node().to_sexp(),
+            "incremental parse diverged from fresh parse of: {text:?}"
+        );
+    }
+
+    #[test]
     fn test_apply_change_out_of_bounds_line_is_clamped() {
         // A position beyond the last line degrades to the document end
         // instead of panicking the main loop.

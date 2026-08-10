@@ -70,17 +70,19 @@ pub fn lsp_textdocchange_to_ts_inputedit(
 
     let new_end_byte = start.byte as usize + text_end_byte_idx;
 
-    let new_end_position = {
-        if new_end_byte >= source.len_bytes() {
-            let line_idx = text.lines().count();
-            let line_byte_idx = ropey::str_utils::line_to_byte_idx(text, line_idx);
-            let row = u32::try_from(source.len_lines() + line_idx)? as usize;
-            let column = u32::try_from(text_end_byte_idx - line_byte_idx)? as usize;
-            Ok(tree_sitter::Point::new(row, column))
-        } else {
-            byte_to_tree_sitter_point(source, new_end_byte)
-        }
-    }?;
+    // The new end is the start plus the extent of the inserted text itself.
+    // It must not be derived from `source`: the rope still holds the OLD
+    // document, so mapping the new byte offset through it (or worse, adding
+    // line counts to the old total) yields garbage Points — and tree-sitter
+    // trusts InputEdits, so garbage here silently corrupts every subsequent
+    // incremental parse.
+    let new_end_position = match text.rfind('\n') {
+        Some(last_nl) => tree_sitter::Point::new(
+            start.point.row + text.bytes().filter(|&b| b == b'\n').count(),
+            text_end_byte_idx - last_nl - 1,
+        ),
+        None => tree_sitter::Point::new(start.point.row, start.point.column + text_end_byte_idx),
+    };
 
     Ok(tree_sitter::InputEdit {
         start_byte: start.byte as usize,
@@ -155,6 +157,7 @@ fn lsp_position_to_core(
     })
 }
 
+#[cfg(test)]
 fn byte_to_tree_sitter_point(
     source: &ropey::Rope,
     byte_idx: usize,
@@ -344,6 +347,58 @@ mod tests {
         assert_eq!(edit.start_byte, 0);
         assert_eq!(edit.old_end_byte, 17);
         assert_eq!(edit.new_end_byte, 0);
+    }
+
+    #[test]
+    fn test_new_end_position_measures_inserted_text_not_old_rope() {
+        // Replacing "a\nb" (2 lines) with "xyz" (1 line): the new end is
+        // (0, 3). The old code mapped the new byte offset through the old
+        // rope and answered (1, 1).
+        let source = Rope::from("a\nb cd");
+        let change = TextDocumentContentChangeEvent::TextDocumentContentChangePartial(
+            TextDocumentContentChangePartial {
+                range: Range {
+                    start: Position::new(0, 0),
+                    end: Position::new(1, 1),
+                },
+                text: "xyz".to_string(),
+                ..Default::default()
+            },
+        );
+        let edit = lsp_textdocchange_to_ts_inputedit(&source, &change).unwrap();
+        assert_eq!(edit.new_end_position, Point::new(0, 3));
+
+        // Appending "x" at the end of a 1-line doc: new end is (0, len+1).
+        // The old code answered row = len_lines + lines(text) = 2.
+        let source = Rope::from("hello");
+        let change = TextDocumentContentChangeEvent::TextDocumentContentChangePartial(
+            TextDocumentContentChangePartial {
+                range: Range {
+                    start: Position::new(0, 5),
+                    end: Position::new(0, 5),
+                },
+                text: "x".to_string(),
+                ..Default::default()
+            },
+        );
+        let edit = lsp_textdocchange_to_ts_inputedit(&source, &change).unwrap();
+        assert_eq!(edit.new_end_position, Point::new(0, 6));
+
+        // Multi-line insert: rows advance by the newline count, column
+        // restarts after the last newline.
+        let source = Rope::from("hello\n");
+        let change = TextDocumentContentChangeEvent::TextDocumentContentChangePartial(
+            TextDocumentContentChangePartial {
+                range: Range {
+                    start: Position::new(1, 0),
+                    end: Position::new(1, 0),
+                },
+                text: "aa\nbbb\ncc".to_string(),
+                ..Default::default()
+            },
+        );
+        let edit = lsp_textdocchange_to_ts_inputedit(&source, &change).unwrap();
+        assert_eq!(edit.new_end_position, Point::new(3, 2));
     }
 
     #[test]
