@@ -332,6 +332,15 @@ impl DocumentStore {
         self.forest.get(uri)
     }
 
+    /// The text matching this file's forest tree: the open buffer if there is
+    /// one, else the cached rope from the last (re-)parse.
+    pub(crate) fn get_content(&self, uri: &PathBuf) -> Option<String> {
+        self.open_docs
+            .get(uri)
+            .map(|d| d.text_string())
+            .or_else(|| self.forest_content.get(uri).map(|r| r.to_string()))
+    }
+
     pub(crate) fn has_open_doc(&self, uri: &PathBuf) -> bool {
         self.open_docs.contains_key(uri)
     }

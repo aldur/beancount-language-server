@@ -129,17 +129,26 @@ pub(crate) fn extract_include_paths(
 
 /// Parse all files reachable via `include` directives starting from `tree`/`file`.
 ///
+/// `text` must be the source `tree` was parsed from — the editor buffer for an
+/// open document, not the file on disk: the two can differ (unsaved changes),
+/// and slicing the tree's byte ranges out of the wrong bytes walks out of
+/// bounds.
+///
 /// Calls `on_parsed` for each newly discovered file. Pre-populate `already_seen`
 /// with paths to skip (e.g. already loaded in DocumentStore).
 pub(crate) fn parse_reachable_includes(
     tree: &tree_sitter::Tree,
     file: &path::Path,
+    text: &str,
     already_seen: &mut HashSet<PathBuf>,
     on_parsed: &mut impl FnMut(PathBuf, tree_sitter::Tree, &str) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let text = fs::read_to_string(file)?;
-    let include_paths = extract_include_paths(tree, text.as_bytes(), file);
-    for path in include_paths {
+    // Iterative: this runs in the did_open notification handler on the main
+    // loop, and a deep include chain must not overflow its stack.
+    let mut queue: Vec<PathBuf> = extract_include_paths(tree, text.as_bytes(), file)
+        .into_iter()
+        .collect();
+    while let Some(path) = queue.pop() {
         if already_seen.contains(&path) {
             continue;
         }
@@ -148,7 +157,7 @@ pub(crate) fn parse_reachable_includes(
             Ok(content) => {
                 if let Some(new_tree) = crate::treesitter_utils::parse_beancount(&content) {
                     on_parsed(path.clone(), new_tree.clone(), &content)?;
-                    parse_reachable_includes(&new_tree, &path, already_seen, on_parsed)?;
+                    queue.extend(extract_include_paths(&new_tree, content.as_bytes(), &path));
                 }
             }
             Err(e) => {

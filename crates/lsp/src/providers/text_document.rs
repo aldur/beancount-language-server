@@ -32,6 +32,12 @@ fn process_includes(
         Some(tree) => tree.clone(),
         None => return Ok(()),
     };
+    // The text the tree was parsed from — for an open document that is the
+    // buffer, which can differ from the file on disk.
+    let text = match state.doc_store.get_content(file_path) {
+        Some(text) => text,
+        None => return Ok(()),
+    };
 
     // Pre-populate already_seen with files already in the forest to skip them.
     let known: Vec<PathBuf> = state.doc_store.forest_keys().cloned().collect();
@@ -40,6 +46,7 @@ fn process_includes(
     forest::parse_reachable_includes(
         &tree,
         file_path,
+        &text,
         processed,
         &mut |path, new_tree, content| {
             state.doc_store.insert_parsed(path, new_tree, content);
