@@ -75,8 +75,8 @@ impl PostingAmount {
 }
 
 #[derive(Debug)]
-struct Posting {
-    node: tree_sitter::Node<'static>,
+struct Posting<'tree> {
+    node: tree_sitter::Node<'tree>,
     amount: Option<PostingAmount>,
 }
 
@@ -200,21 +200,18 @@ fn get_transaction_line_end_position(
 }
 
 /// Extract all postings from a transaction
-fn extract_postings(txn_node: &tree_sitter::Node, content: &ropey::Rope) -> Option<Vec<Posting>> {
+fn extract_postings<'tree>(
+    txn_node: &tree_sitter::Node<'tree>,
+    content: &ropey::Rope,
+) -> Option<Vec<Posting<'tree>>> {
     let mut postings = Vec::new();
     let mut cursor = txn_node.walk();
 
     for child in txn_node.children(&mut cursor) {
         if child.kind() == "posting" {
             let amount = extract_amount(&child, content);
-            // SAFETY: We're storing the node in a context where we know the tree outlives it
-            // This is safe because we're processing synchronously and the tree is kept alive
-            // by the snapshot throughout the entire inlay_hints call
-            let static_node = unsafe {
-                std::mem::transmute::<tree_sitter::Node<'_>, tree_sitter::Node<'static>>(child)
-            };
             postings.push(Posting {
-                node: static_node,
+                node: child,
                 amount,
             });
         }
@@ -528,7 +525,7 @@ impl ExprParser<'_> {
 }
 
 /// Calculate hint for balancing amounts (postings without explicit amounts)
-fn calculate_balancing_hint(postings: &[Posting], content: &ropey::Rope) -> Option<InlayHint> {
+fn calculate_balancing_hint(postings: &[Posting<'_>], content: &ropey::Rope) -> Option<InlayHint> {
     // Find posting without amount
     let posting_without_amount = postings.iter().find(|p| p.amount.is_none())?;
 
@@ -635,7 +632,7 @@ fn calculate_balancing_hint(postings: &[Posting], content: &ropey::Rope) -> Opti
 }
 
 /// Find the column where amounts typically appear in postings for alignment
-fn find_amount_column(postings: &[Posting]) -> usize {
+fn find_amount_column(postings: &[Posting<'_>]) -> usize {
     // Look at postings with amounts to find where the amount starts
     for posting in postings {
         if posting.amount.is_some() {
@@ -666,7 +663,7 @@ fn find_account_end_column(posting_node: &tree_sitter::Node) -> usize {
 }
 
 /// Calculate hint for transaction total (only when not balanced)
-fn calculate_total_hint(postings: &[Posting], position: Position) -> Option<InlayHint> {
+fn calculate_total_hint(postings: &[Posting<'_>], position: Position) -> Option<InlayHint> {
     // Calculate total for each currency
     // If a posting has a price, convert it to the price currency
     let mut totals: HashMap<String, rust_decimal::Decimal> = HashMap::new();
