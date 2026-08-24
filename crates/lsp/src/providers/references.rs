@@ -16,11 +16,11 @@ use tracing::debug;
 use tree_sitter::StreamingIterator;
 use tree_sitter_beancount::tree_sitter;
 
-fn node_text_at_position(
-    tree: &tree_sitter::Tree,
+fn account_node_at_position<'tree>(
+    tree: &'tree tree_sitter::Tree,
     content: &Rope,
     position: lsp_types::Position,
-) -> Result<Option<String>> {
+) -> Result<Option<tree_sitter::Node<'tree>>> {
     let (start, end) = lsp_position_to_tree_sitter_point_range(content, position)?;
     let Some(node) = tree
         .root_node()
@@ -36,7 +36,16 @@ fn node_text_at_position(
         return Ok(None);
     }
 
-    Ok(Some(text_for_tree_sitter_node(content, &node)))
+    Ok(Some(node))
+}
+
+fn node_text_at_position(
+    tree: &tree_sitter::Tree,
+    content: &Rope,
+    position: lsp_types::Position,
+) -> Result<Option<String>> {
+    Ok(account_node_at_position(tree, content, position)?
+        .map(|node| text_for_tree_sitter_node(content, &node)))
 }
 
 /// Provider function for `textDocument/references`.
@@ -73,6 +82,43 @@ pub(crate) fn references(
         &node_text,
     );
     Ok(Some(locs))
+}
+
+/// Provider function for `textDocument/prepareRename`.
+///
+/// Without this, clients fall back to their own word detection. Vim's
+/// `<cword>` stops at `:`, so it offers only one segment of an account
+/// (for example `Assets` from `Assets:Checking`). We return the range
+/// and text of the full account node instead.
+pub(crate) fn prepare_rename(
+    snapshot: LspServerStateSnapshot,
+    params: lsp_types::PrepareRenameParams,
+) -> Result<Option<lsp_types::PrepareRenameResult>> {
+    let uri = &params.text_document_position_params.text_document.uri;
+    let (tree, doc) = match snapshot.tree_and_document_for_uri(uri) {
+        Ok(v) => v,
+        Err(e) => {
+            debug!("PrepareRename: failed to get tree/document for uri: {e}");
+            return Ok(None);
+        }
+    };
+
+    let content = &doc.content;
+    let position = params.text_document_position_params.position;
+    let Some(node) = account_node_at_position(tree, content, position)
+        .with_context(|| format!("failed to get node at position for uri: {}", uri.as_str()))?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(
+        lsp_types::PrepareRenameResult::PrepareRenamePlaceholder(
+            lsp_types::PrepareRenamePlaceholder {
+                range: tree_sitter_node_to_lsp_range(content, &node),
+                placeholder: text_for_tree_sitter_node(content, &node),
+            },
+        ),
+    ))
 }
 
 /// Provider function for `textDocument/rename`.
@@ -415,6 +461,66 @@ mod tests {
         assert_eq!(edits.len(), 2); // Rename in both locations
         assert_eq!(edits[0].new_text, "Assets:Bank");
         assert_eq!(edits[1].new_text, "Assets:Bank");
+    }
+
+    #[test]
+    fn test_prepare_rename_returns_full_account_range() {
+        let content = r#"
+2024-01-01 open Assets:Checking
+2024-01-02 * "Test"
+  Assets:Checking  100.00 USD
+"#;
+        let state = TestState::new(content).unwrap();
+
+        let uri = lsp_types::Uri::from_file_path(&state.path).unwrap();
+        // Put the cursor after the first `:`, inside `Checking`.
+        let params = lsp_types::PrepareRenameParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri },
+                position: lsp_types::Position {
+                    line: 3,
+                    character: 12,
+                },
+            },
+            work_done_progress_params: Default::default(),
+        };
+
+        let result = prepare_rename(state.snapshot, params).unwrap();
+        let Some(lsp_types::PrepareRenameResult::PrepareRenamePlaceholder(placeholder)) = result
+        else {
+            panic!("Expected PrepareRenamePlaceholder");
+        };
+        assert_eq!(placeholder.placeholder, "Assets:Checking");
+        assert_eq!(placeholder.range.start.line, 3);
+        assert_eq!(placeholder.range.start.character, 2);
+        assert_eq!(placeholder.range.end.line, 3);
+        assert_eq!(placeholder.range.end.character, 17);
+    }
+
+    #[test]
+    fn test_prepare_rename_outside_account() {
+        let content = r#"
+2024-01-01 open Assets:Checking
+2024-01-02 * "Test"
+  Assets:Checking  100.00 USD
+"#;
+        let state = TestState::new(content).unwrap();
+
+        let uri = lsp_types::Uri::from_file_path(&state.path).unwrap();
+        // The date is not an account, so rename must not start there.
+        let params = lsp_types::PrepareRenameParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri },
+                position: lsp_types::Position {
+                    line: 1,
+                    character: 4,
+                },
+            },
+            work_done_progress_params: Default::default(),
+        };
+
+        let result = prepare_rename(state.snapshot, params).unwrap();
+        assert!(result.is_none());
     }
 
     #[test]
