@@ -700,8 +700,18 @@ mod tests {
     fn test_resolve_python_cmd_venv_priority() {
         #[cfg(unix)]
         {
+            use std::env;
             use std::fs;
             use tempfile::TempDir;
+
+            // Lock to prevent parallel execution with other env var tests
+            let _guard = ENV_TEST_LOCK.lock().unwrap();
+
+            // Ensure BEANCOUNT_LSP_PYTHON is not set for this test
+            let original_value = env::var("BEANCOUNT_LSP_PYTHON").ok();
+            unsafe {
+                env::remove_var("BEANCOUNT_LSP_PYTHON");
+            }
 
             let temp_dir = TempDir::new().unwrap();
             let venv_dir = temp_dir.path().join(".venv");
@@ -720,6 +730,13 @@ mod tests {
                 timeout_secs: 120,
             };
             let result = resolve_python_cmd(&config, temp_dir.path());
+
+            // Restore original state
+            unsafe {
+                if let Some(original) = original_value {
+                    env::set_var("BEANCOUNT_LSP_PYTHON", original);
+                }
+            }
 
             // Should prefer venv python over system python
             assert!(result.is_some());
